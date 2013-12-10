@@ -33,7 +33,6 @@ from pylons.i18n import _, ungettext, get_lang
 import random
 import babel.numbers
 
-from r2.lib.permissions import ModeratorPermissionSet
 from r2.lib.translation import set_lang
 
 __all__ = ['StringHandler', 'strings', 'PluralManager', 'plurals',
@@ -78,8 +77,6 @@ string_dict = dict(
     oauth_login_msg = _(
         "Log in or register to connect your reddit account with %(app)s."),
 
-    login_fallback_msg = _("try using our secure login form."),
-
     legal = _("I understand and agree that registration on or use of this site constitutes agreement to its %(user_agreement)s and %(privacy_policy)s."),
 
     friends = _('to view reddit with only submissions from your friends, use [reddit.com/r/friends](%s)'),
@@ -109,6 +106,7 @@ string_dict = dict(
         syntax_error = _('syntax error: "%(syntaxerror)s"'),
         no_imports = _('@imports are not allowed'),
         invalid_property_list = _('invalid CSS property list "%(proplist)s"'),
+        custom_images_only = _('only uploaded images are allowed; reference them with the %%imagename%% system below'),
         unknown_rule_type = _('unknown CSS rule type "%(ruletype)s"')
     ),
     permalink_title = _("%(author)s comments on %(title)s"),
@@ -138,14 +136,14 @@ string_dict = dict(
     unverified_quota_msg = _("Looks like you're either a brand new user or your posts have not been doing well recently. You may have to wait a bit to post again. In the meantime feel free to [check out the reddiquette](%(reddiquette)s), join the conversation in a different thread, or [verify your email address](%(verify)s)."),
     read_only_msg = _("reddit is in \"emergency read-only mode\" right now. :( you won't be able to log in. we're sorry, and are working frantically to fix the problem."),
     heavy_load_msg = _("this page is temporarily in read-only mode due to heavy traffic."),
-    gold_benefits_msg = _("Being a reddit gold member gives you access to a bunch of new site features and other benefits. Be sure to check out the new options in the gold box at the bottom of [your preferences page](/prefs), and take a look at [the about gold page](/gold/about) to see what else is available!"),
-    lounge_msg = _("please grab a drink and join us in [the lounge](%(link)s)."),
+    gold_benefits_msg = _("reddit gold is reddit's premium membership program. Here are the benefits:\n\n* [Extra site features](/gold/about)\n* [Extra perks](/gold/partners)\n* Discuss and get help on the features and perks at /r/goldbenefits"),
+    lounge_msg = _("Grab a drink and join us in /r/lounge, the super-secret members-only community that may or may not exist."),
     postcard_msg = _("You sent us a postcard! (Or something similar.) When we run out of room on our refrigerator, we might one day auction off the stuff that people sent in. Is it okay if we include your thing?"),
     over_comment_limit = _("Sorry, the maximum number of comments is %(max)d. (However, if you subscribe to reddit gold, it goes up to %(goldmax)d.)"),
     over_comment_limit_gold = _("Sorry, the maximum number of comments is %d."),
-    youve_got_gold = _("%(sender)s just sent you %(amount)s of reddit gold! Wasn't that nice?"),
+    youve_got_gold = _("%(sender)s just gifted you %(amount)s of reddit gold!"),
     giftgold_note = _("Here's a note that was included:\n\n----\n\n"),
-    youve_got_comment_gold = _("A redditor liked [your comment](%(url)s) so much, they gave you a month of reddit gold. Shiny!"),
+    youve_got_comment_gold = _("Another user liked [your comment](%(url)s) so much that they gilded it, giving you reddit gold.\n\n"),
     gold_summary_autorenew = _("You're about to set up an ongoing, autorenewing subscription to reddit gold for yourself (%(user)s)."),
     gold_summary_onetime = _("You're about to make a one-time purchase of %(amount)s of reddit gold for yourself (%(user)s)."),
     gold_summary_creddits = _("You're about to purchase %(amount)s of reddit gold creddits. They work like gift certificates: each creddit you have will allow you to give one month of reddit gold to someone else."),
@@ -165,6 +163,7 @@ apps below.
     traffic_promoted_link_explanation = _("Below you will see your promotion's impression and click traffic per hour of promotion.  Please note that these traffic totals will lag behind by two to three hours, and that daily totals will be preliminary until 24 hours after the link has finished its run."),
     traffic_processing_slow = _("Traffic processing is currently running slow. The latest data available is from %(date)s. This page will be updated as new data becomes available."),
     traffic_processing_normal = _("Traffic processing occurs on an hourly basis. The latest data available is from %(date)s. This page will be updated as new data becomes available."),
+    traffic_help_email = _("Questions? Email self serve support: %(email)s"),
 
     traffic_subreddit_explanation = _("""
 Below are the traffic statistics for your subreddit. Each graph represents one of the following over the interval specified.
@@ -176,37 +175,12 @@ Below are the traffic statistics for your subreddit. Each graph represents one o
 Note: there are a couple of places outside of your subreddit where someone can click "subscribe", so it is possible (though unlikely) that the subscription count can exceed the unique count on a given day.
 """),
 
-    go = _("go"),
-    view_subreddit_traffic = _("view subreddit traffic"),
-
-    an_error_occurred = _("an error occurred (status: %(status)s)"),
-    an_error_occurred_friendly = _("an error occurred. please try again later! (status: %(status)s)"),
-    rate_limit = _("please wait a few seconds and try again."),
     subscribed_multi = _("multireddit of your subscriptions"),
     mod_multi = _("multireddit of subreddits you moderate"),
 
     r_all_description = _("/r/all displays content from all of reddit, including subreddits you aren't subscribed to."),
     r_all_minus_description = _("Displaying content from /r/all of reddit, except the following subreddits:"),
     all_minus_gold_only = _('Filtering /r/all is a feature only available to [reddit gold](/gold/about) subscribers. Displaying unfiltered results from /r/all.'),
-
-    missing_credit_name = _("missing name"),
-    bad_credit_number = _("invalid credit card number"),
-    bad_credit_expiry = _("invalid expiration date"),
-    bad_credit_cvc = _("invalid cvc"),
-    missing_credit_address = _("missing address"),
-    missing_credit_city = _("missing city"),
-    missing_credit_state = _("missing state or province"),
-    missing_credit_country = _("missing country"),
-    missing_credit_zip = _("missing zip code"),
-
-    permissions = dict(
-        info=dict(
-            moderator=ModeratorPermissionSet.info,
-            moderator_invite=ModeratorPermissionSet.info,
-        ),
-        all_msg=_("full permissions"),
-        none_msg=_("no permissions"),
-    ),
 )
 
 class StringHandler(object):

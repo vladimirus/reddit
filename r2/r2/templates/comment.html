@@ -34,7 +34,11 @@
 ##################
 
 <%def name="thing_data_attributes(what)" buffered="True">
-${parent.thing_data_attributes(what)} data-ups="${what.upvotes}" data-downs="${what.downvotes}"
+  %if what.score_hidden:
+    ${parent.thing_data_attributes(what)} data-ups="0" data-downs="0"
+  %else:
+    ${parent.thing_data_attributes(what)} data-ups="${what.upvotes}" data-downs="${what.downvotes}"
+  %endif
 </%def>
 
 <%def name="midcol(display=True, cls = '')">
@@ -43,7 +47,9 @@ ${parent.midcol(not thing.collapsed, cls = cls)}
 
 <%def name="ParentDiv()">
   ${parent.ParentDiv()}
-  <a name="${thing._id36}" ></a>
+  %if not thing.deleted:
+    <a name="${thing._id36}"></a>
+  %endif
   %if c.profilepage:
     %if thing.link: 
       %if thing.link.title:
@@ -105,19 +111,27 @@ ${parent.collapsed()}
   %if collapse and thing.collapsed and show:
     ${thing.collapsed_reason}
   %else:
-    %if show and not (thing.link.contest_mode and thing.score_hidden):
-       ${unsafe(self.score(thing, likes = thing.likes))}&#32;
+    %if show:
+      %if thing.score_hidden:
+        <span title="${_('this subreddit hides comment scores for %d minutes') % thing.subreddit.comment_score_hide_mins}">
+          [${_("score hidden")}]
+        </span>&#32;
+      %else:
+        ${unsafe(self.score(thing, likes = thing.likes))}&#32;
+      %endif
     %endif
     ${thing_timestamp(thing, thing.timesince)}&#32;${_("ago")}
     ${edited(thing, thing.lastedited)}
   %endif
 
   % if thing.gilded_message:
-  <span class="gilded-comment-icon" title="${thing.gilded_message}" data-count="${thing.gildings}">
-    % if thing.gildings > 1:
-      x${thing.gildings}
-    % endif
-  </span>
+  <a href="${thing.subreddit_path}gilded">
+    <span class="gilded-comment-icon" title="${thing.gilded_message}" data-count="${thing.gildings}">
+      % if thing.gildings > 1:
+        x${thing.gildings}
+      % endif
+    </span>
+  </a>
   % endif
 
   %if collapse:
@@ -127,6 +141,7 @@ ${parent.collapsed()}
         ${ungettext("child", "children", thing.num_children)})
     </a>
   %endif
+  ${self.approval_checkmark()}
 </%def>
 
 <%def name="Child()">

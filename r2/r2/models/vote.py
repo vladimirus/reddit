@@ -65,13 +65,14 @@ class VotesByAccount(tdb_cassandra.DenormalizedRelation):
                            % (cls, thing1_cls, thing2_cls))
 
     @classmethod
-    def copy_from(cls, pgvote):
+    def copy_from(cls, pgvote, vote_info):
         rel = cls.rel(Account, pgvote._thing2.__class__)
-        rel.create(pgvote._thing1, pgvote._thing2, opaque=pgvote)
+        rel.create(pgvote._thing1, pgvote._thing2, pgvote=pgvote,
+                   vote_info=vote_info)
 
     @classmethod
-    def value_for(cls, thing1, thing2, opaque):
-        return opaque._name
+    def value_for(cls, thing1, thing2, pgvote, vote_info):
+        return pgvote._name
 
 
 class LinkVotesByAccount(VotesByAccount):
@@ -96,7 +97,7 @@ class VoteDetailsByThing(tdb_cassandra.View):
                                        default_validation_class=UTF8_TYPE)
 
     @classmethod
-    def create(cls, thing1, thing2s, pgvote):
+    def create(cls, thing1, thing2s, pgvote, vote_info):
         assert len(thing2s) == 1
 
         voter = pgvote._thing1
@@ -108,9 +109,9 @@ class VoteDetailsByThing(tdb_cassandra.View):
             valid_user=pgvote.valid_user,
             valid_thing=pgvote.valid_thing,
             ip=getattr(pgvote, "ip", ""),
-            organic=getattr(pgvote, "organic", False),
         )
-
+        if vote_info and isinstance(vote_info, basestring):
+            details['vote_info'] = vote_info
         cls._set_values(votee._id36, {voter._id36: json.dumps(details)})
 
     @classmethod
@@ -123,13 +124,17 @@ class VoteDetailsByThing(tdb_cassandra.View):
             raise ValueError
 
         try:
-            raw_details = details_cls._byID(thing._id36)._values()
+            raw_details = details_cls._byID(thing._id36)
+            return raw_details.decode_details()
         except tdb_cassandra.NotFound:
-            raw_details = {}
+            return []
+
+    def decode_details(self):
+        raw_details = self._values()
         details = []
         for key, value in raw_details.iteritems():
             data = Storage(json.loads(value))
-            data["_id"] = key + "_" + thing._id36
+            data["_id"] = key + "_" + self._id
             data["voter_id"] = key
             details.append(data)
         details.sort(key=lambda d: d["date"])
@@ -152,8 +157,8 @@ class Vote(MultiRelation('vote',
     _defaults = {'organic': False}
 
     @classmethod
-    def vote(cls, sub, obj, dir, ip, organic = False, cheater = False,
-             timer=None):
+    def vote(cls, sub, obj, dir, ip, vote_info = None, cheater = False,
+             timer=None, date=None):
         from admintools import valid_user, valid_thing, update_score
         from r2.lib.count import incr_sr_count
         from r2.lib.db import queries
@@ -188,20 +193,18 @@ class Vote(MultiRelation('vote',
             old_valid_thing = getattr(v, 'valid_thing', False)
             v.valid_thing = (valid_thing(v, karma, cheater = cheater)
                              and getattr(v,'valid_thing', False))
-            v.valid_user = (getattr(v, 'valid_user', False)                   
+            v.valid_user = (getattr(v, 'valid_user', False)
                             and v.valid_thing
                             and valid_user(v, sr, karma))
         #new vote
         else:
             is_new = True
             oldamount = 0
-            v = rel(sub, obj, str(amount))
+            v = rel(sub, obj, str(amount), date=date)
             v.ip = ip
             old_valid_thing = v.valid_thing = valid_thing(v, karma, cheater = cheater)
             v.valid_user = (v.valid_thing and valid_user(v, sr, karma)
                             and not is_self_link)
-            if organic:
-                v.organic = organic
 
         v._commit()
 
@@ -229,7 +232,7 @@ class Vote(MultiRelation('vote',
 
         # now write it out to Cassandra. We'll write it out to both
         # this way for a while
-        VotesByAccount.copy_from(v)
+        VotesByAccount.copy_from(v, vote_info)
         timer.intermediate("cassavotes")
 
         queries.changed(v._thing2, True)

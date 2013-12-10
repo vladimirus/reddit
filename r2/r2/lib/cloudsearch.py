@@ -70,7 +70,7 @@ def safe_get(get_fn, ids, return_dict=True, **kw):
         try:
             item = get_fn(i, **kw)
         except NotFound:
-            g.log.info("%r failed for %r", get_fn, i)
+            g.log.info("%s failed for %r", get_fn.__name__, i)
         else:
             items[i] = item
     if return_dict:
@@ -330,10 +330,10 @@ class CloudSearchUploader(object):
     use_safe_get = False
     types = ()
 
-    def __init__(self, doc_api, things=None, version_offset=_VERSION_OFFSET):
+    def __init__(self, doc_api, fullnames=None, version_offset=_VERSION_OFFSET):
         self.doc_api = doc_api
         self._version_offset = version_offset
-        self.things = self.desired_things(things) if things else []
+        self.fullnames = fullnames
 
     @classmethod
     def desired_fullnames(cls, items):
@@ -345,10 +345,6 @@ class CloudSearchUploader(object):
             if item_type in type_ids:
                 fullnames.add(item['fullname'])
         return fullnames
-
-    @classmethod
-    def desired_things(cls, things):
-        return [t for t in things if isinstance(t, cls.types)]
 
     def _version_tenths(self):
         '''Cloudsearch documents don't update unless the sent "version" field
@@ -429,7 +425,15 @@ class CloudSearchUploader(object):
         raise NotImplementedError
 
     def batch_lookups(self):
-        pass
+        try:
+            self.things = Thing._by_fullname(self.fullnames, data=True,
+                                             return_dict=False)
+        except NotFound:
+            if self.use_safe_get:
+                self.things = safe_get(Thing._by_fullname, self.fullnames,
+                                       data=True, return_dict=False)
+            else:
+                raise
 
     def fields(self, thing):
         raise NotImplementedError
@@ -441,12 +445,34 @@ class CloudSearchUploader(object):
         '''
         xml_things = self.xml_from_things()
 
+        if not len(xml_things):
+            return 0
+
         cs_start = datetime.now(g.tz)
-        if len(xml_things):
-            sent = self.send_documents(xml_things)
-            if not quiet:
-                print sent
-        return (datetime.now(g.tz) - cs_start).total_seconds()
+        sent = self.send_documents(xml_things)
+        cs_time = (datetime.now(g.tz) - cs_start).total_seconds()
+
+        adds, deletes, warnings = 0, 0, []
+        for record in sent:
+            response = etree.fromstring(record)
+            adds += int(response.get("adds", 0))
+            deletes += int(response.get("deletes", 0))
+            if response.get("warnings"):
+                warnings.append(response.get("warnings"))
+
+        g.stats.simple_event("cloudsearch.uploads.adds", delta=adds)
+        g.stats.simple_event("cloudsearch.uploads.deletes", delta=deletes)
+        g.stats.simple_event("cloudsearch.uploads.warnings",
+                delta=len(warnings))
+
+        if not quiet:
+            print "%s Changes: +%i -%i" % (self.__class__.__name__,
+                                           adds, deletes)
+            if len(warnings):
+                print "%s Warnings: %s" % (self.__class__.__name__,
+                                           "; ".join(warnings))
+
+        return cs_time
 
     def send_documents(self, docs):
         '''Open a connection to the cloudsearch endpoint, and send the documents
@@ -480,8 +506,8 @@ class CloudSearchUploader(object):
 class LinkUploader(CloudSearchUploader):
     types = (Link,)
 
-    def __init__(self, doc_api, things=None, version_offset=_VERSION_OFFSET):
-        super(LinkUploader, self).__init__(doc_api, things, version_offset)
+    def __init__(self, doc_api, fullnames=None, version_offset=_VERSION_OFFSET):
+        super(LinkUploader, self).__init__(doc_api, fullnames, version_offset)
         self.accounts = {}
         self.srs = {}
 
@@ -492,6 +518,7 @@ class LinkUploader(CloudSearchUploader):
         return LinkFields(thing, account, sr).fields()
 
     def batch_lookups(self):
+        super(LinkUploader, self).batch_lookups()
         author_ids = [thing.author_id for thing in self.things
                       if hasattr(thing, 'author_id')]
         try:
@@ -554,6 +581,7 @@ def chunk_xml(xml, depth=0):
             yield chunk
 
 
+@g.stats.amqp_processor('cloudsearch_q')
 def _run_changed(msgs, chan):
     '''Consume the cloudsearch_changes queue, and print reporting information
     on how long it took and how many remain
@@ -563,14 +591,12 @@ def _run_changed(msgs, chan):
 
     changed = [pickle.loads(msg.body) for msg in msgs]
 
-    fullnames = set()
-    fullnames.update(LinkUploader.desired_fullnames(changed))
-    fullnames.update(SubredditUploader.desired_fullnames(changed))
-    things = Thing._by_fullname(fullnames, data=True, return_dict=False)
+    link_fns = LinkUploader.desired_fullnames(changed)
+    sr_fns = SubredditUploader.desired_fullnames(changed)
 
-    link_uploader = LinkUploader(g.CLOUDSEARCH_DOC_API, things=things)
+    link_uploader = LinkUploader(g.CLOUDSEARCH_DOC_API, fullnames=link_fns)
     subreddit_uploader = SubredditUploader(g.CLOUDSEARCH_SUBREDDIT_DOC_API,
-                                           things=things)
+                                           fullnames=sr_fns)
 
     link_time = link_uploader.inject()
     subreddit_time = subreddit_uploader.inject()
@@ -581,7 +607,7 @@ def _run_changed(msgs, chan):
     print ("%s: %d messages in %.2fs seconds (%.2fs secs waiting on "
            "cloudsearch); %d duplicates, %s remaining)" %
            (start, len(changed), totaltime, cloudsearch_time,
-            len(changed) - len(things),
+            len(changed) - len(link_fns | sr_fns),
             msgs[-1].delivery_info.get('message_count', 'unknown')))
 
 

@@ -5,7 +5,7 @@ r.analytics = {
     init: function() {
         // these guys are relying on the custom 'onshow' from jquery.reddit.js
         $(document).delegate(
-            '.promotedlink.promoted',
+            '.organic-listing .promotedlink.promoted, .comments-page .promotedlink.promoted',
             'onshow',
             _.bind(function(ev) {
                 this.fetchTrackersOrFirePixel(ev.target)
@@ -13,7 +13,6 @@ r.analytics = {
         )
 
         $('.promotedlink.promoted:visible').trigger('onshow')
-        $('form.google-checkout').on('submit', this.fireGoogleCheckout)
         $('form.gold-checkout').one('submit', this.fireGoldCheckout)
     },
 
@@ -80,6 +79,14 @@ r.analytics = {
             'r': Math.round(Math.random() * 2147483647) // cachebuster
         })
 
+        var adServerPixel = new Image(),
+            adServerImpPixel = $el.data('adserverImpPixel'),
+            adServerClickUrl = $el.data('adserverClickUrl')
+
+        if (adServerImpPixel) {
+            adServerPixel.src = adServerImpPixel
+        }
+
         // If IE7/8 thinks the text of a link looks like an email address
         // (e.g. it has an @ in it), then setting the href replaces the
         // text as well. We'll store the original text and replace it to
@@ -87,11 +94,14 @@ r.analytics = {
         var link = $el.find('a.title'),
             old_html = link.html(),
             dest = link.attr('href'),
-            click_url = r.config.clicktracker_url + '?' + $.param({
-            'id': trackingName,
-            'hash': hash,
-            'url': dest
-        })
+            click_params = {
+                'id': trackingName,
+                'hash': hash,
+                'url': dest
+            },
+            click_url
+
+        click_url = r.config.clicktracker_url + '?' + $.param(click_params)
 
         save_href(link)
         link.attr('href', click_url)
@@ -103,6 +113,13 @@ r.analytics = {
         var thumb = $el.find('a.thumbnail')
         save_href(thumb)
         thumb.attr('href', click_url)
+
+        // also do the "comments" link for selftext promos
+        if ($el.hasClass('self')) {
+            var comments = $el.find('a.comments')
+            save_href(comments)
+            comments.attr('href', click_url)
+        }
 
         $el.data('trackerFired', true)
     },
@@ -130,21 +147,17 @@ r.analytics = {
         // If GA is loaded, have GA process form submission after firing
         // (and cancel the default).
         _gaq.push(['_trackPageview', '/gold/external/' + vendor])
-        _gaq.push(function(){ form.submit() })
-        
+        _gaq.push(function() {
+            // Give GA half a second to send out its pixel.
+            setTimeout(function() {
+                form.submit()
+            }, 500)
+        })
+
         if (_gat && _gat._getTracker){
           // GA is loaded; form will submit via the _gaq.push'ed function
           event.preventDefault()
         }
-    },
-    
-    fireGoogleCheckout: function(event) {
-        var form = $(this)
-        form.parent().addClass('working')
-        _gaq.push(function(){
-          var pageTracker = _gaq._getAsyncTracker()
-          setUrchinInputCode(pageTracker)
-        })
     }
 }
 

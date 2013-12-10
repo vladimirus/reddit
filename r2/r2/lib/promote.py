@@ -20,50 +20,50 @@
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from __future__ import with_statement
-
-from collections import OrderedDict, namedtuple
+from collections import namedtuple
 from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
+import itertools
 import json
-import math
-import random
 import time
 
 from pylons import g, c
 from pylons.i18n import ungettext
 
-from r2.lib.wrapped import Wrapped
 from r2.lib import (
     amqp,
     authorize,
     emailer,
-    inventory,
+    hooks,
 )
-from r2.lib.db.queries import set_promote_status
+from r2.lib.db.operators import not_
+from r2.lib.db.queries import (
+    set_promote_status,
+    set_underdelivered_campaigns,
+    unset_underdelivered_campaigns,
+)
+from r2.lib.cache import sgm
 from r2.lib.memoize import memoize
-from r2.lib.organic import keep_fresh_links
 from r2.lib.strings import strings
 from r2.lib.template_helpers import get_domain
-from r2.lib.utils import UniqueIterator, tup, to_date, weighted_lottery
+from r2.lib.utils import tup, to_date, weighted_lottery
 from r2.models import (
     Account,
-    AdWeight,
     Bid,
     DefaultSR,
     FakeAccount,
     FakeSubreddit,
     get_promote_srid,
-    IDBuilder,
     Link,
-    LiveAdWeights,
     MultiReddit,
-    NotFound,
+    NO_TRANSACTION,
     PromoCampaign,
     PROMOTE_STATUS,
     PromotedLink,
     PromotionLog,
     PromotionWeights,
     Subreddit,
+    traffic,
 )
 from r2.models.keyvalue import NamedGlobals
 
@@ -72,7 +72,6 @@ UPDATE_QUEUE = 'update_promos_q'
 QUEUE_ALL = 'all'
 
 PROMO_HEALTH_KEY = 'promotions_last_updated'
-
 
 def _mark_promos_updated():
     NamedGlobals.set(PROMO_HEALTH_KEY, time.time())
@@ -109,10 +108,9 @@ def promotraffic_url(l): # new traffic url
     domain = get_domain(cname=False, subreddit=False)
     return "http://%s/promoted/traffic/headline/%s" % (domain, l._id36)
 
-def promo_edit_url(l=None, id36=""):
-    if l: id36 = l._id36
+def promo_edit_url(l):
     domain = get_domain(cname=False, subreddit=False)
-    return "http://%s/promoted/edit_promo/%s" % (domain, id36)
+    return "http://%s/promoted/edit_promo/%s" % (domain, l._id36)
 
 def pay_url(l, campaign):
     return "%spromoted/pay/%s/%s" % (g.payment_domain, l._id36, campaign._id36)
@@ -122,6 +120,12 @@ def view_live_url(l, srname):
     if srname:
         url += '/r/%s' % srname
     return 'http://%s/?ad=%s' % (url, l._fullname)
+
+
+def refund_url(link, campaign):
+    return "%spromoted/refund/%s/%s" % (g.payment_domain, link._id36,
+                                        campaign._id36)
+
 
 # booleans
 
@@ -146,127 +150,79 @@ def is_rejected(link):
 def is_promoted(link):
     return is_promo(link) and link.promote_status == PROMOTE_STATUS.promoted
 
-def is_live_on_sr(link, srname):
-    if not is_promoted(link):
-        return False
-    live = scheduled_campaigns_by_link(link)
-    srname = srname.lower()
-    srname = srname if srname != DefaultSR.name.lower() else ''
+def is_live_on_sr(link, sr):
+    return bool(live_campaigns_by_link(link, sr=sr))
 
-    campaigns = PromoCampaign._byID(live, return_dict=True)
-    for campaign_id in live:
-        campaign = campaigns.get(campaign_id)
-        if campaign and campaign.sr_name.lower() == srname:
-            return True
-    return False
-
-
-def campaign_is_live(link, campaign_index):
-    if not is_promoted(link):
-        return False
-    live = scheduled_campaigns_by_link(link)
-    return campaign_index in live
-
-
-# subreddit roadblocking functions
-
-roadblock_prefix = "promotion_roadblock"
-def roadblock_key(sr_name, d):
-    return "%s-%s_%s" % (roadblock_prefix,
-                         sr_name, d.strftime("%Y_%m_%d"))
-
-def roadblock_reddit(sr_name, start_date, end_date):
-    d = start_date
-    now = promo_datetime_now().date()
-    # set the expire to be 1 week after the roadblock end date
-    expire = ((end_date - now).days + 7) * 86400
-    while d < end_date:
-        g.hardcache.add(roadblock_key(sr_name, d),
-                        "%s-%s" % (start_date.strftime("%Y_%m_%d"),
-                                   end_date.strftime("%Y_%m_%d")),
-                        time=expire)
-        d += timedelta(1)
-
-def unroadblock_reddit(sr_name, start_date, end_date):
-    d = start_date
-    while d < end_date:
-        g.hardcache.delete(roadblock_key(sr_name, d))
-        d += timedelta(1)
-
-def is_roadblocked(sr_name, start_date, end_date):
-    d = start_date
-    while d < end_date:
-        res = g.hardcache.get(roadblock_key(sr_name, d))
-        if res:
-            start_date, end_date = res.split('-')
-            start_date = datetime.strptime(start_date, "%Y_%m_%d").date()
-            end_date = datetime.strptime(end_date, "%Y_%m_%d").date()
-            return (start_date, end_date)
-        d += timedelta(1)
-
-def get_roadblocks():
-    rbs = g.hardcache.backend.ids_by_category(roadblock_prefix)
-    by_sr = {}
-    for rb in rbs:
-        rb = rb.rsplit('_', 3)  # subreddit_name_YYYY_MM_DD
-        date = datetime.strptime('_'.join(rb[1:]), "%Y_%m_%d").date()
-        by_sr.setdefault(rb[0], []).append((date, date + timedelta(1)))
-
-    blobs = []
-    for k, v in by_sr.iteritems():
-        for sd, ed in sorted(v):
-            if blobs and  blobs[-1][0] == k and blobs[-1][-1] == sd:
-                blobs[-1] = (k, blobs[-1][1], ed)
-            else:
-                blobs.append((k, sd, ed))
-    blobs.sort(key=lambda x: x[1])
-    return blobs
 
 # control functions
 
 class RenderableCampaign():
-    def __init__(self, campaign_id36, start_date, end_date, duration, bid, sr,
-                 status):
+    def __init__(self, campaign_id36, start_date, end_date, duration, bid,
+                 spent, cpm, sr, priority, status):
         self.campaign_id36 = campaign_id36
         self.start_date = start_date
         self.end_date = end_date
         self.duration = duration
-        self.bid = bid
+
+        if priority.cpm:
+            self.bid = "%.2f" % bid
+            self.spent = "%.2f" % spent
+        else:
+            self.bid = "N/A"
+            self.spent = "N/A"
+
+        self.cpm = cpm
         self.sr = sr
+        self.priority_name = priority.name
+        self.inventory_override = ("override" if priority.inventory_override
+                                              else "")
         self.status = status
 
     @classmethod
     def create(cls, link, campaigns):
         transactions = get_transactions(link, campaigns)
-        live_campaigns = scheduled_campaigns_by_link(link)
+        live_campaigns = live_campaigns_by_link(link)
         user_is_sponsor = c.user_is_sponsor
+        today = promo_datetime_now().date()
         r = []
         for camp in campaigns:
             transaction = transactions.get(camp._id)
             campaign_id36 = camp._id36
             start_date = camp.start_date.strftime("%m/%d/%Y")
             end_date = camp.end_date.strftime("%m/%d/%Y")
-            ndays = (camp.end_date - camp.start_date).days
+            ndays = camp.ndays
             duration = strings.time_label % dict(num=ndays,
                             time=ungettext("day", "days", ndays))
-            bid = "%.2f" % camp.bid
+            bid = camp.bid
+            spent = get_spent_amount(camp)
+            cpm = getattr(camp, 'cpm', g.cpm_selfserve.pennies)
             sr = camp.sr_name
+            live = camp in live_campaigns
+            pending = today < to_date(camp.start_date)
+            complete = (transaction and (transaction.is_charged() or
+                                         transaction.is_refund()) and
+                        not (live or pending))
+
             status = {'paid': bool(transaction),
-                      'complete': False,
+                      'complete': complete,
                       'free': camp.is_freebie(),
                       'pay_url': pay_url(link, camp),
                       'view_live_url': view_live_url(link, sr),
                       'sponsor': user_is_sponsor,
-                      'live': camp._id in live_campaigns}
-            if transaction:
-                if transaction.is_void():
-                    status['paid'] = False
-                    status['free'] = False
-                elif transaction.is_charged():
-                    status['complete'] = True
+                      'live': live,
+                      'non_cpm': not camp.priority.cpm}
 
-            rc = cls(campaign_id36, start_date, end_date, duration, bid, sr,
-                     status)
+            if transaction and transaction.is_void():
+                status['paid'] = False
+                status['free'] = False
+
+            if complete and user_is_sponsor and not transaction.is_refund():
+                if spent < bid:
+                    status['refund'] = True
+                    status['refund_url'] = refund_url(link, camp)
+
+            rc = cls(campaign_id36, start_date, end_date, duration, bid, spent,
+                     cpm, sr, camp.priority, status)
             r.append(rc)
         return r
 
@@ -278,10 +234,6 @@ def get_renderable_campaigns(link, campaigns):
         r = r[0]
     return r
 
-def wrap_promoted(link):
-    if not isinstance(link, Wrapped):
-        link = Wrapped(link)
-    return link
 
 # These could be done with relationships, but that seeks overkill as
 # we never query based on user and only check per-thing
@@ -310,14 +262,13 @@ def rm_traffic_viewer(thing, user):
 def traffic_viewers(thing):
     return sorted(getattr(thing, "promo_traffic_viewers", set()))
 
-def traffic_totals():
-    from r2.models import traffic
-    impressions = traffic.AdImpressionsByCodename.historical_totals("day")
-    clicks = traffic.ClickthroughsByCodename.historical_totals("day")
-    traffic_data = traffic.zip_timeseries(impressions, clicks)
-    return [(d.date(), v) for d, v in traffic_data]
 
-def new_promotion(title, url, user, ip):
+def update_promote_status(link, status):
+    set_promote_status(link, status)
+    hooks.get_hook('promote.edit_promotion').call(link=link)
+
+
+def new_promotion(title, url, selftext, user, ip):
     """
     Creates a new promotion with the provided title, etc, and sets it
     status to be 'unpaid'.
@@ -327,13 +278,15 @@ def new_promotion(title, url, user, ip):
     l.promoted = True
     l.disable_comments = False
     PromotionLog.add(l, 'promotion created')
+
+    if url == 'self':
+        l.url = l.make_permalink_slow()
+        l.is_self = True
+        l.selftext = selftext
+
     l._commit()
 
-    # set the status of the link, populating the query queue
-    if c.user_is_sponsor or user.trusted_sponsor:
-        set_promote_status(l, PROMOTE_STATUS.accepted)
-    else:
-        set_promote_status(l, PROMOTE_STATUS.unpaid)
+    update_promote_status(l, PROMOTE_STATUS.unpaid)
 
     # the user has posted a promotion, so enable the promote menu unless
     # they have already opted out
@@ -345,14 +298,6 @@ def new_promotion(title, url, user, ip):
     emailer.new_promo(l)
     return l
 
-def sponsor_wrapper(link):
-    w = Wrapped(link)
-    w.render_class = PromotedLink
-    w.rowstyle = "promoted link"
-    return w
-
-def campaign_lock(link):
-    return "edit_promo_campaign_lock_" + str(link._id)
 
 def get_transactions(link, campaigns):
     """Return Bids for specified campaigns on the link.
@@ -373,34 +318,42 @@ def get_transactions(link, campaigns):
     bids_by_campaign = {c._id: bid_dict[(c._id, c.trans_id)] for c in campaigns}
     return bids_by_campaign
 
-def new_campaign(link, dates, bid, sr):
+def new_campaign(link, dates, bid, cpm, sr, priority):
     # empty string for sr_name means target to all
     sr_name = sr.name if sr else ""
-    campaign = PromoCampaign._new(link, sr_name, bid, dates[0], dates[1])
+    campaign = PromoCampaign._new(link, sr_name, bid, cpm, dates[0], dates[1],
+                                  priority)
     PromotionWeights.add(link, campaign._id, sr_name, dates[0], dates[1], bid)
     PromotionLog.add(link, 'campaign %s created' % campaign._id)
-    author = Account._byID(link.author_id, True)
-    if getattr(author, "complimentary_promos", False):
-        free_campaign(link, campaign, c.user)
+
+    if campaign.priority.cpm:
+        author = Account._byID(link.author_id, data=True)
+        if getattr(author, "complimentary_promos", False):
+            free_campaign(link, campaign, c.user)
+
+    hooks.get_hook('promote.new_campaign').call(link=link, campaign=campaign)
     return campaign
+
 
 def free_campaign(link, campaign, user):
     auth_campaign(link, campaign, user, -1)
 
-def edit_campaign(link, campaign, dates, bid, sr):
+def edit_campaign(link, campaign, dates, bid, cpm, sr, priority):
     sr_name = sr.name if sr else '' # empty string means target to all
-    try:
-        # if the bid amount changed, cancel any pending transactions
-        if campaign.bid != bid:
-            void_campaign(link, campaign)
 
-        # update the schedule
-        PromotionWeights.reschedule(link, campaign._id, sr_name,
-                                    dates[0], dates[1], bid)
+    # if the bid amount changed, cancel any pending transactions
+    if campaign.bid != bid:
+        void_campaign(link, campaign)
 
-        # update values in the db
-        campaign.update(dates[0], dates[1], bid, sr_name, campaign.trans_id, commit=True)
+    # update the schedule
+    PromotionWeights.reschedule(link, campaign._id, sr_name,
+                                dates[0], dates[1], bid)
 
+    # update values in the db
+    campaign.update(dates[0], dates[1], bid, cpm, sr_name,
+                    campaign.trans_id, priority, commit=True)
+
+    if campaign.priority.cpm:
         # record the transaction
         text = 'updated campaign %s. (bid: %0.2f)' % (campaign._id, bid)
         PromotionLog.add(link, text)
@@ -410,28 +363,15 @@ def edit_campaign(link, campaign, dates, bid, sr):
         if getattr(author, "complimentary_promos", False):
             free_campaign(link, campaign, c.user)
 
-    except Exception, e: # record error and rethrow 
-        g.log.error("Failed to update PromoCampaign %s on link %d. Error was: %r" %
-                    (campaign._id, link._id, e))
-        try: # wrapped in try/except so orig error won't be lost if commit fails
-            text = 'update FAILED. (campaign: %s, bid: %.2f)' % (campaign._id,
-                                                                 bid)
-            PromotionLog.add(link, text)
-        except:
-            pass
-        raise e
+    hooks.get_hook('promote.edit_campaign').call(link=link, campaign=campaign)
 
-
-def complimentary(username, value=True):
-    a = Account._by_name(username, True)
-    a.complimentary_promos = value
-    a._commit()
 
 def delete_campaign(link, campaign):
     PromotionWeights.delete_unfinished(link, campaign._id)
     void_campaign(link, campaign)
     campaign.delete()
     PromotionLog.add(link, 'deleted campaign %s' % campaign._id)
+    hooks.get_hook('promote.delete_campaign').call(link=link, campaign=campaign)
 
 def void_campaign(link, campaign):
     transactions = get_transactions(link, [campaign])
@@ -471,9 +411,8 @@ def auth_campaign(link, campaign, user, pay_id):
             new_status = max(PROMOTE_STATUS.unseen, link.promote_status)
         else:
             new_status = max(PROMOTE_STATUS.unpaid, link.promote_status)
-        set_promote_status(link, new_status)
-        # notify of campaign creation
-        # update the query queue
+        update_promote_status(link, new_status)
+
         if user and (user._id == link.author_id) and trans_id > 0:
             emailer.promo_bid(link, campaign.bid, campaign.start_date)
 
@@ -502,329 +441,321 @@ def promo_datetime_now(offset=None):
         now += timedelta(offset)
     return now
 
+
 def accept_promotion(link):
-    """
-    Accepting is campaign agnostic.  Accepting the ad just means that
-    it is allowed to run if payment has been processed.
+    update_promote_status(link, PROMOTE_STATUS.accepted)
 
-    If a campagn is able to run, this also requeues it.
-    """
-    PromotionLog.add(link, 'status update: accepted')
-    # update the query queue
-
-    set_promote_status(link, PROMOTE_STATUS.accepted)
-    now = promo_datetime_now(0)
-    if link._fullname in set(l.thing_name for l in
-                             PromotionWeights.get_campaigns(now)):
-        PromotionLog.add(link, 'Marked promotion for acceptance')
-        charge_pending(0) # campaign must be charged before it will go live
-        queue_changed_promo(link, "accepted")
     if link._spam:
         link._spam = False
         link._commit()
+
     emailer.accept_promo(link)
 
-def reject_promotion(link, reason=None):
-    PromotionLog.add(link, 'status update: rejected')
-    # update the query queue
-    # Since status is updated first,
-    # if make_daily_promotions happens to run
-    # while we're doing work here, it will correctly exclude it
-    set_promote_status(link, PROMOTE_STATUS.rejected)
+    # if the link has campaigns running now charge them and promote the link
+    now = promo_datetime_now()
+    campaigns = list(PromoCampaign._by_link(link._id))
+    is_live = False
+    for camp in campaigns:
+        if is_accepted_promo(now, link, camp):
+            charge_campaign(link, camp)
+            if charged_or_not_needed(camp):
+                promote_link(link, camp)
+                is_live = True
 
-    all_ads = get_live_promotions([LiveAdWeights.ALL_ADS])
-    links = set(x.link for x in all_ads[LiveAdWeights.ALL_ADS])
-    if link._fullname in links:
-        PromotionLog.add(link, 'Marked promotion for rejection')
-        queue_changed_promo(link, "rejected")
+    if is_live:
+        all_live_promo_srnames(_update=True)
+
+
+def reject_promotion(link, reason=None):
+    was_live = is_promoted(link)
+    update_promote_status(link, PROMOTE_STATUS.rejected)
 
     # Send a rejection email (unless the advertiser requested the reject)
     if not c.user or c.user._id != link.author_id:
         emailer.reject_promo(link, reason=reason)
 
+    if was_live:
+        all_live_promo_srnames(_update=True)
 
 
 def unapprove_promotion(link):
-    PromotionLog.add(link, 'status update: unapproved')
-    # update the query queue
-    set_promote_status(link, PROMOTE_STATUS.unseen)
+    update_promote_status(link, PROMOTE_STATUS.unseen)
 
-def accepted_campaigns(offset=0):
-    now = promo_datetime_now(offset=offset)
-    promo_weights = PromotionWeights.get_campaigns(now)
-    all_links = Link._by_fullname(set(x.thing_name for x in promo_weights),
-                                  data=True, return_dict=True)
-    accepted_links = {}
-    for link_fullname, link in all_links.iteritems():
-        if is_accepted(link):
-            accepted_links[link._id] = link
 
-    accepted_link_ids = accepted_links.keys()
-    campaign_query = PromoCampaign._query(PromoCampaign.c.link_id == accepted_link_ids,
-                                          data=True)
-    campaigns = dict((camp._id, camp) for camp in campaign_query)
-    for pw in promo_weights:
-        campaign = campaigns.get(pw.promo_idx)
-        if not campaign or not campaign.trans_id:
-            continue
-        link = accepted_links.get(campaign.link_id)
-        if not link:
-            continue
+def authed_or_not_needed(campaign):
+    authed = campaign.trans_id != NO_TRANSACTION
+    needs_auth = campaign.priority.cpm
+    return authed or not needs_auth
 
-        yield (link, campaign, pw.weight)
 
-def get_scheduled(offset=0):
-    """
-    Arguments:
-      offset - number of days after today you want the schedule for
-    Returns:
-      {'by_sr': dict, 'links':set(), 'error_campaigns':[]}
-      -by_sr maps sr names to lists of (Link, bid, campaign_fullname) tuples
-      -links is the set of promoted Link objects used in the schedule
-      -error_campaigns is a list of (campaign_id, error_msg) tuples if any 
-        exceptions were raised or an empty list if there were none
-      Note: campaigns in error_campaigns will not be included in by_sr
+def charged_or_not_needed(campaign):
+    # True if a campaign has a charged transaction or doesn't need one
+    charged = authorize.is_charged_transaction(campaign.trans_id, campaign._id)
+    needs_charge = campaign.priority.cpm
+    return charged or not needs_charge
 
-    """
-    by_sr = {}
-    error_campaigns = []
-    links = set()
-    for l, campaign, weight in accepted_campaigns(offset=offset):
-        try:
-            if authorize.is_charged_transaction(campaign.trans_id, campaign._id):
-                adweight = AdWeight(l._fullname, weight, campaign._fullname)
-                by_sr.setdefault(campaign.sr_name, []).append(adweight)
-                links.add(l)
-        except Exception, e: # could happen if campaign things have corrupt data
-            error_campaigns.append((campaign._id, e))
-    return by_sr, links, error_campaigns
 
-def fuzz_impressions(imps):
-    """Return imps rounded to one significant digit."""
-    if imps > 0:
-        ndigits = int(math.floor(math.log10(imps)))
-        return int(round(imps, -1 * ndigits)) # note the negative
-    else:
-        return 0
+def is_accepted_promo(date, link, campaign):
+    return (campaign.start_date <= date < campaign.end_date and
+            is_accepted(link) and
+            authed_or_not_needed(campaign))
 
-def get_scheduled_impressions(sr_name, start_date, end_date):
-    # FIXME: mock function for development
-    start_date = to_date(start_date)
-    end_date = to_date(end_date)
-    ndays = (end_date - start_date).days
-    scheduled = OrderedDict()
-    for i in range(ndays):
-        date = (start_date + timedelta(i))
-        scheduled[date] = random.randint(0, 100) # FIXME: fakedata
-    return scheduled
 
-def get_available_impressions(sr_name, start_date, end_date, fuzzed=False):
-    # FIXME: mock function for development
-    start_date = to_date(start_date)
-    end_date = to_date(end_date)
-    available = inventory.get_predicted_by_date(sr_name, start_date, end_date)
-    scheduled = get_scheduled_impressions(sr_name, start_date, end_date)
-    for date in scheduled:
-        available[date] = int(available[date] - (available[date] * scheduled[date] / 100.)) # DELETEME
-        #available[date] = max(0, available[date] - scheduled[date]) # UNCOMMENTME
-        if fuzzed:
-            available[date] = fuzz_impressions(available[date])
-    return available
+def is_scheduled_promo(date, link, campaign):
+    return (is_accepted_promo(date, link, campaign) and 
+            charged_or_not_needed(campaign))
+
+
+def is_live_promo(link, campaign):
+    now = promo_datetime_now()
+    return is_promoted(link) and is_scheduled_promo(now, link, campaign)
+
+
+def get_promos(date, sr_names=None, link=None):
+    pws = PromotionWeights.get_campaigns(date, sr_names=sr_names, link=link)
+    campaign_ids = {pw.promo_idx for pw in pws}
+    campaigns = PromoCampaign._byID(campaign_ids, data=True, return_dict=False)
+    link_ids = {camp.link_id for camp in campaigns}
+    links = Link._byID(link_ids, data=True)
+    for camp in campaigns:
+        yield camp, links[camp.link_id]
+
+
+def get_accepted_promos(offset=0):
+    date = promo_datetime_now(offset=offset)
+    for camp, link in get_promos(date):
+        if is_accepted_promo(date, link, camp):
+            yield camp, link
+
+
+def get_scheduled_promos(offset=0):
+    date = promo_datetime_now(offset=offset)
+    for camp, link in get_promos(date):
+        if is_scheduled_promo(date, link, camp):
+            yield camp, link
+
+
+def charge_campaign(link, campaign):
+    if charged_or_not_needed(campaign):
+        return
+
+    user = Account._byID(link.author_id)
+    charge_succeeded = authorize.charge_transaction(user, campaign.trans_id,
+                                                    campaign._id)
+
+    if not charge_succeeded:
+        return
+
+    hooks.get_hook('promote.edit_campaign').call(link=link, campaign=campaign)
+
+    if not is_promoted(link):
+        update_promote_status(link, PROMOTE_STATUS.pending)
+
+    emailer.queue_promo(link, campaign.bid, campaign.trans_id)
+    text = ('auth charge for campaign %s, trans_id: %d' %
+            (campaign._id, campaign.trans_id))
+    PromotionLog.add(link, text)
+
 
 def charge_pending(offset=1):
-    for l, camp, weight in accepted_campaigns(offset=offset):
-        user = Account._byID(l.author_id)
-        try:
-            if (authorize.is_charged_transaction(camp.trans_id, camp._id) or not
-                authorize.charge_transaction(user, camp.trans_id, camp._id)):
-                continue
-
-            if is_promoted(l):
-                emailer.queue_promo(l, camp.bid, camp.trans_id)
-            else:
-                set_promote_status(l, PROMOTE_STATUS.pending)
-                emailer.queue_promo(l, camp.bid, camp.trans_id)
-            text = ('auth charge for campaign %s, trans_id: %d' %
-                    (camp._id, camp.trans_id))
-            PromotionLog.add(l, text)
-        except:
-            print "Error on %s, campaign %s" % (l, camp._id)
+    for camp, link in get_accepted_promos(offset=offset):
+        charge_campaign(link, camp)
 
 
-def scheduled_campaigns_by_link(l, date=None):
-    # A promotion/campaign is scheduled/live if it's in
-    # PromotionWeights.get_campaigns(now) and
-    # authorize.is_charged_transaction()
-
-    date = date or promo_datetime_now()
-
-    if not is_accepted(l):
+def live_campaigns_by_link(link, sr=None):
+    if not is_promoted(link):
         return []
 
-    scheduled = PromotionWeights.get_campaigns(date)
-    campaigns = [c.promo_idx for c in scheduled if c.thing_name == l._fullname]
-
-    # Check authorize
-    accepted = []
-    for campaign_id in campaigns:
-        try:
-            campaign = PromoCampaign._byID(campaign_id, data=True)
-            if authorize.is_charged_transaction(campaign.trans_id, campaign_id):
-                accepted.append(campaign_id)
-        except NotFound:
-            g.log.error("PromoCampaign %d scheduled to run on %s not found." %
-                          (campaign_id, date.strftime("%Y-%m-%d")))
-
-    return accepted
-
-def promotion_key():
-    return "current_promotions:1"
-
-def get_live_promotions(srids):
-    timer = g.stats.get_timer("promote.get_live")
-    timer.start()
-    weights = LiveAdWeights.get(srids)
-    timer.stop()
-    return weights
-
-
-def set_live_promotions(weights):
-    start = time.time()
-    # First, figure out which subreddits have had ads recently
-    today = promo_datetime_now()
-    yesterday = today - timedelta(days=1)
-    tomorrow = today + timedelta(days=1)
-    promo_weights = PromotionWeights.get_campaigns(yesterday, tomorrow)
-    subreddit_names = set(p.sr_name for p in promo_weights)
-    subreddits = Subreddit._by_name(subreddit_names).values()
-    # Set the default for those subreddits to no ads
-    all_weights = {sr._id: [] for sr in subreddits}
-
-    # Mix in the currently live ads
-    all_weights.update(weights)
-    if '' in all_weights:
-        all_weights[LiveAdWeights.FRONT_PAGE] = all_weights.pop('')
-
-    LiveAdWeights.set_all_from_weights(all_weights)
-    end = time.time()
-    g.log.info("promote.set_live_promotions completed in %s seconds",
-               end - start)
-
-# Gotcha: even if links are scheduled and authorized, they won't be added to 
-# current promotions until they're actually charged, so make sure to call
-# charge_pending() before make_daily_promotions()
-def make_daily_promotions(offset=0, test=False):
-    """
-    Arguments:
-      offset - number of days after today to get the schedule for
-      test - if True, new schedule will be generated but not launched
-    Raises Exception with list of campaigns that had errors if there were any
-    """
-    by_srname, links, error_campaigns = get_scheduled(offset)
-    all_links = set([l._fullname for l in links])
-    srs = Subreddit._by_name(by_srname.keys())
-
-    # over18 check
-    for srname, adweights in by_srname.iteritems():
-        if srname:
-            sr = srs[srname]
-            if sr.over_18:
-                sr_links = Link._by_fullname([a.link for a in adweights],
-                                             return_dict=False)
-                for l in sr_links:
-                    l.over_18 = True
-                    if not test:
-                        l._commit()
-
-    old_ads = get_live_promotions([LiveAdWeights.ALL_ADS])
-    old_links = set(x.link for x in old_ads[LiveAdWeights.ALL_ADS])
-
-    # links that need to be promoted
-    new_links = all_links - old_links
-    # links that have already been promoted
-    old_links = old_links - all_links
-
-    links = Link._by_fullname(new_links.union(old_links), data=True,
-                              return_dict=True)
-
-    for l in old_links:
-        if is_promoted(links[l]):
-            if test:
-                print "unpromote", l
-            else:
-                # update the query queue
-                set_promote_status(links[l], PROMOTE_STATUS.finished)
-                emailer.finished_promo(links[l])
-
-    for l in new_links:
-        if is_accepted(links[l]):
-            if test:
-                print "promote2", l
-            else:
-                # update the query queue
-                set_promote_status(links[l], PROMOTE_STATUS.promoted)
-                emailer.live_promo(links[l])
-
-    # convert the weighted dict to use sr_ids which are more useful
-    by_srid = {srs[srname]._id: adweights for srname, adweights
-                                          in by_srname.iteritems()
-                                          if srname != ''}
-    if '' in by_srname:
-        by_srid[''] = by_srname['']
-
-    if not test:
-        set_live_promotions(by_srid)
-        _mark_promos_updated()
+    if sr:
+        sr_names = [''] if isinstance(sr, DefaultSR) else [sr.name]
     else:
-        print by_srid
+        sr_names = None
 
-    # after launching as many campaigns as possible, raise an exception to 
-    #   report any error campaigns. (useful for triggering alerts in irc)
-    if error_campaigns:
-        raise Exception("Some scheduled campaigns could not be added to daily "
-                        "promotions: %r" % error_campaigns)
+    now = promo_datetime_now()
+    return [camp for camp, link in get_promos(now, sr_names=sr_names,
+                                              link=link)
+            if is_live_promo(link, camp)]
+
+
+def promote_link(link, campaign):
+    if (not link.over_18 and
+        campaign.sr_name and Subreddit._by_name(campaign.sr_name).over_18):
+        link.over_18 = True
+        link._commit()
+
+    if not is_promoted(link):
+        update_promote_status(link, PROMOTE_STATUS.promoted)
+        emailer.live_promo(link)
+
+
+def make_daily_promotions():
+    # charge campaigns so they can go live
+    charge_pending(offset=0)
+    charge_pending(offset=1)
+
+    # promote links and record ids of promoted links
+    link_ids = set()
+    for campaign, link in get_scheduled_promos(offset=0):
+        link_ids.add(link._id)
+        promote_link(link, campaign)
+
+    # expire finished links
+    q = Link._query(Link.c.promote_status == PROMOTE_STATUS.promoted, data=True)
+    q = q._filter(not_(Link.c._id.in_(link_ids)))
+    for link in q:
+        update_promote_status(link, PROMOTE_STATUS.finished)
+        emailer.finished_promo(link)
+
+    # update subreddits with promos
+    all_live_promo_srnames(_update=True)
+
+    _mark_promos_updated()
+    finalize_completed_campaigns(daysago=1)
+    hooks.get_hook('promote.make_daily_promotions').call(offset=0)
+
+
+def finalize_completed_campaigns(daysago=1):
+    # PromoCampaign.end_date is utc datetime with year, month, day only
+    now = datetime.now(g.tz)
+    date = now - timedelta(days=daysago)
+    date = date.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    q = PromoCampaign._query(PromoCampaign.c.end_date == date,
+                             # exclude no transaction and freebies
+                             PromoCampaign.c.trans_id > 0,
+                             data=True)
+    campaigns = list(q)
+
+    if not campaigns:
+        return
+
+    # check that traffic is up to date
+    earliest_campaign = min(campaigns, key=lambda camp: camp.start_date)
+    start, end = get_total_run(earliest_campaign)
+    missing_traffic = traffic.get_missing_traffic(start.replace(tzinfo=None),
+                                                  date.replace(tzinfo=None))
+    if missing_traffic:
+        raise ValueError("Can't finalize campaigns finished on %s."
+                         "Missing traffic from %s" % (date, missing_traffic))
+
+    links = Link._byID([camp.link_id for camp in campaigns], data=True)
+    underdelivered_campaigns = []
+
+    for camp in campaigns:
+        if hasattr(camp, 'refund_amount'):
+            continue
+
+        link = links[camp.link_id]
+        billable_impressions = get_billable_impressions(camp)
+        billable_amount = get_billable_amount(camp, billable_impressions)
+
+        if billable_amount >= camp.bid:
+            if hasattr(camp, 'cpm'):
+                text = '%s completed with $%s billable (%s impressions @ $%s).'
+                text %= (camp, billable_amount, billable_impressions, camp.cpm)
+            else:
+                text = '%s completed with $%s billable (pre-CPM).'
+                text %= (camp, billable_amount) 
+            PromotionLog.add(link, text)
+            camp.refund_amount = 0.
+            camp._commit()
+        else:
+            underdelivered_campaigns.append(camp)
+
+        if underdelivered_campaigns:
+            set_underdelivered_campaigns(underdelivered_campaigns)
+
+
+def get_refund_amount(camp, billable):
+    existing_refund = getattr(camp, 'refund_amount', 0.)
+    charge = camp.bid - existing_refund
+    refund_amount = charge - billable
+    refund_amount = Decimal(str(refund_amount)).quantize(Decimal('.01'),
+                                                    rounding=ROUND_UP)
+    return max(float(refund_amount), 0.)
+
+
+def refund_campaign(link, camp, billable_amount, billable_impressions):
+    refund_amount = get_refund_amount(camp, billable_amount)
+    if refund_amount <= 0:
+        return
+
+    owner = Account._byID(camp.owner_id, data=True)
+    try:
+        success = authorize.refund_transaction(owner, camp.trans_id,
+                                               camp._id, refund_amount)
+    except authorize.AuthorizeNetException as e:
+        text = ('%s $%s refund failed' % (camp, refund_amount))
+        PromotionLog.add(link, text)
+        g.log.debug(text + ' (response: %s)' % e)
+        return
+
+    text = ('%s completed with $%s billable (%s impressions @ $%s).'
+            ' %s refunded.' % (camp, billable_amount,
+                               billable_impressions, camp.cpm,
+                               refund_amount))
+    PromotionLog.add(link, text)
+    camp.refund_amount = refund_amount
+    camp._commit()
+    unset_underdelivered_campaigns(camp)
+    emailer.refunded_promo(link)
 
 
 PromoTuple = namedtuple('PromoTuple', ['link', 'weight', 'campaign'])
 
 
-def get_promotion_list(user, site):
+@memoize('all_live_promo_srnames')
+def all_live_promo_srnames():
+    now = promo_datetime_now()
+    return {camp.sr_name for camp, link in get_promos(now)
+            if is_live_promo(link, camp)}
+
+
+def srnames_from_site(user, site):
     if not isinstance(site, FakeSubreddit):
-        srids = set([site._id])
+        srnames = {site.name}
     elif isinstance(site, MultiReddit):
-        srids = set(site.sr_ids)
+        srnames = {sr.name for sr in site.srs}
     elif user and not isinstance(user, FakeAccount):
-        srids = set(Subreddit.reverse_subscriber_ids(user) + [""])
+        srnames = {sr.name for sr in Subreddit.user_subreddits(user, ids=False)}
+        srnames.add('')
     else:
-        srids = set(Subreddit.user_subreddits(None, ids=True) + [""])
-
-    tuples = get_promotion_list_cached(srids)
-    return [PromoTuple(*t) for t in tuples]
-
-
-@memoize('promotion_list', time=60)
-def get_promotion_list_cached(sites):
-    weights = get_live_promotions(sites)
-    if not weights:
-        return []
-
-    promos = []
-    total = 0.
-    for sr_id, sr_weights in weights.iteritems():
-        if sr_id not in sites:
-            continue
-        for link, weight, campaign in sr_weights:
-            total += weight
-            promos.append((link, weight, campaign))
-
-    return [(link, weight / total, campaign)
-            for link, weight, campaign in promos]
+        srnames = {sr.name for sr in Subreddit.user_subreddits(None, ids=False)}
+        srnames.add('')
+    return srnames
 
 
-def lottery_promoted_links(user, site, n=10):
+def srnames_with_live_promos(user, site):
+    site_srnames = srnames_from_site(user, site)
+    promo_srnames = all_live_promo_srnames()
+    return promo_srnames.intersection(site_srnames)
+
+
+def _get_live_promotions(sr_names):
+    now = promo_datetime_now()
+    ret = {sr_name: [] for sr_name in sr_names}
+    for camp, link in get_promos(now, sr_names=sr_names):
+        if is_live_promo(link, camp):
+            weight = (camp.bid / camp.ndays)
+            pt = PromoTuple(link=link._fullname, weight=weight,
+                            campaign=camp._fullname)
+            ret[camp.sr_name].append(pt)
+    return ret
+
+
+def get_live_promotions(sr_names):
+    promos_by_srname = sgm(g.cache, sr_names, miss_fn=_get_live_promotions,
+                           prefix='live_promotions', time=60)
+    return itertools.chain.from_iterable(promos_by_srname.itervalues())
+
+
+def lottery_promoted_links(sr_names, n=10):
     """Run weighted_lottery to order and choose a subset of promoted links."""
-    promo_tuples = get_promotion_list(user, site)
-    weights = {p: p.weight for p in promo_tuples}
+    promo_tuples = get_live_promotions(sr_names)
+
+    # house priority campaigns have weight of 0, use some small value
+    # so they'll show if there are no other campaigns
+    weights = {p: p.weight or 0.001 for p in promo_tuples}
     selected = []
     while weights and len(selected) < n:
         s = weighted_lottery(weights)
@@ -833,29 +764,23 @@ def lottery_promoted_links(user, site, n=10):
     return selected
 
 
-def sample_promoted_links(user, site, n=10):
-    """Return a selection of promoted links."""
-    promo_tuples = get_promotion_list(user, site)
-    if len(promo_tuples) <= n:
-        return promo_tuples
-    else:
-        return random.sample(promo_tuples, n)
-
-
-def get_total_run(link):
-    """Return the total time span this promotion has run for.
+def get_total_run(thing):
+    """Return the total time span this link or campaign will run.
 
     Starts at the start date of the earliest campaign and goes to the end date
     of the latest campaign.
 
     """
 
-    campaigns = PromoCampaign._by_link(link._id)
+    if isinstance(thing, Link):
+        campaigns = PromoCampaign._by_link(thing._id)
+    elif isinstance(thing, PromoCampaign):
+        campaigns = [thing]
 
     earliest = None
     latest = None
     for campaign in campaigns:
-        if not campaign.trans_id:
+        if not charged_or_not_needed(campaign):
             continue
 
         if not earliest or campaign.start_date < earliest:
@@ -870,10 +795,56 @@ def get_total_run(link):
         earliest = latest - timedelta(days=30)  # last month
 
     # ugh this stuff is a mess. they're stored as "UTC" but actually mean UTC-5.
-    earliest = earliest.replace(tzinfo=None) - timezone_offset
-    latest = latest.replace(tzinfo=None) - timezone_offset
+    earliest = earliest.replace(tzinfo=g.tz) - timezone_offset
+    latest = latest.replace(tzinfo=g.tz) - timezone_offset
 
     return earliest, latest
+
+
+def get_traffic_dates(thing):
+    """Retrieve the start and end of a Promoted Link or PromoCampaign."""
+    now = datetime.now(g.tz).replace(minute=0, second=0, microsecond=0)
+    start, end = get_total_run(thing)
+    end = min(now, end)
+    return start, end
+
+
+def get_billable_impressions(campaign):
+    start, end = get_traffic_dates(campaign)
+    if start > datetime.now(g.tz):
+        return 0
+
+    traffic_lookup = traffic.TargetedImpressionsByCodename.promotion_history
+    imps = traffic_lookup(campaign._fullname, start.replace(tzinfo=None),
+                          end.replace(tzinfo=None))
+    billable_impressions = sum(imp for date, (imp,) in imps)
+    return billable_impressions
+
+
+def get_billable_amount(camp, impressions):
+    if hasattr(camp, 'cpm'):
+        value_delivered = impressions / 1000. * camp.cpm / 100.
+        billable_amount = min(camp.bid, value_delivered)
+    else:
+        # pre-CPM campaigns are charged in full regardless of impressions
+        billable_amount = camp.bid
+
+    billable_amount = Decimal(str(billable_amount)).quantize(Decimal('.01'),
+                                                        rounding=ROUND_DOWN)
+    return float(billable_amount)
+
+
+def get_spent_amount(campaign):
+    if hasattr(campaign, 'refund_amount'):
+        # no need to calculate spend if we've already refunded
+        spent = campaign.bid - campaign.refund_amount
+    elif not hasattr(campaign, 'cpm'):
+        # pre-CPM campaign
+        return campaign.bid
+    else:
+        billable_impressions = get_billable_impressions(campaign)
+        spent = get_billable_amount(campaign, billable_impressions)
+    return spent
 
 
 def Run(offset=0, verbose=True):
@@ -881,10 +852,7 @@ def Run(offset=0, verbose=True):
     scheduled changes to ads
     
     """
-    if verbose:
-        print "promote.py:Run() - charge_pending()"
-    charge_pending(offset=offset + 1)
-    charge_pending(offset=offset)
+
     if verbose:
         print "promote.py:Run() - amqp.add_item()"
     amqp.add_item(UPDATE_QUEUE, json.dumps(QUEUE_ALL),
@@ -909,17 +877,7 @@ def run_changed(drain=False, limit=100, sleep_time=10, verbose=True):
             # There's no promotion log to update in this case.
             print "Received %s QUEUE_ALL message(s)" % items.count(QUEUE_ALL)
             items = [i for i in items if i != QUEUE_ALL]
-        make_daily_promotions()
-        links = Link._by_fullname([i["link"] for i in items])
-        for item in items:
-            PromotionLog.add(links[item['link']],
-                             "Finished remaking current promotions (this link "
-                             "was: %(message)s" % item)
+            make_daily_promotions()
+
     amqp.handle_items(UPDATE_QUEUE, _run, limit=limit, drain=drain,
                       sleep_time=sleep_time, verbose=verbose)
-
-
-def queue_changed_promo(link, message):
-    msg = {"link": link._fullname, "message": message}
-    amqp.add_item(UPDATE_QUEUE, json.dumps(msg),
-                  delivery_mode=amqp.DELIVERY_TRANSIENT)

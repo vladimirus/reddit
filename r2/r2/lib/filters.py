@@ -150,6 +150,7 @@ valid_link_schemes = (
     'mumble://',
     'ssh://',
     'git://',
+    'ts3server://',
 )
 
 class SouptestSaxHandler(ContentHandler):
@@ -186,7 +187,7 @@ markdown_user_tags = ('table', 'th', 'tr', 'td', 'tbody',
                      'tbody', 'thead', 'tr', 'tfoot', 'caption')
 
 for bt in markdown_boring_tags:
-    markdown_ok_tags[bt] = ('id')
+    markdown_ok_tags[bt] = ('id', 'class')
 
 for bt in markdown_user_tags:
     markdown_ok_tags[bt] = ('colspan', 'rowspan', 'cellspacing', 'cellpadding', 'align', 'scope')
@@ -197,11 +198,11 @@ markdown_xhtml_dtd_path = os.path.join(
 
 markdown_dtd = '<!DOCTYPE div- SYSTEM "file://%s">' % markdown_xhtml_dtd_path
 
-def markdown_souptest(text, nofollow=False, target=None, renderer=None):
+def markdown_souptest(text, nofollow=False, target=None, renderer='reddit'):
     if not text:
         return text
     
-    if not renderer:
+    if renderer == 'reddit':
         smd = safemarkdown(text, nofollow=nofollow, target=target)
     elif renderer == 'wiki':
         smd = wikimarkdown(text)
@@ -237,22 +238,26 @@ def safemarkdown(text, nofollow=False, wrap=True, **kwargs):
     else:
         return SC_OFF + text + SC_ON
 
-def wikimarkdown(text):
-    from r2.lib.cssfilter import legacy_s3_url
+def wikimarkdown(text, include_toc=True, target=None):
+    from r2.lib.template_helpers import media_https_if_secure
+
+    # this hard codes the stylesheet page for now, but should be parameterized
+    # in the future to allow per-page images.
+    from r2.models.wiki import ImagesByWikiPage
+    page_images = ImagesByWikiPage.get_images(c.site, "config/stylesheet")
     
     def img_swap(tag):
         name = tag.get('src')
         name = custom_img_url.search(name)
         name = name and name.group(1)
-        if name and c.site.images.has_key(name):
-            url = c.site.images[name]
-            url = legacy_s3_url(url, c.site)
+        if name and name in page_images:
+            url = page_images[name]
+            url = media_https_if_secure(url)
             tag['src'] = url
         else:
             tag.extract()
     
     nofollow = True
-    target = None
     
     text = snudown.markdown(_force_utf8(text), nofollow, target,
                             renderer=snudown.RENDERER_WIKI)
@@ -264,7 +269,10 @@ def wikimarkdown(text):
     if images:
         [img_swap(image) for image in images]
     
-    inject_table_of_contents(soup, prefix="wiki")
+    if include_toc:
+        tocdiv = generate_table_of_contents(soup, prefix="wiki")
+        if tocdiv:
+            soup.insert(0, tocdiv)
     
     text = str(soup)
     
@@ -272,7 +280,7 @@ def wikimarkdown(text):
 
 title_re = re.compile('[^\w.-]')
 header_re = re.compile('^h[1-6]$')
-def inject_table_of_contents(soup, prefix):
+def generate_table_of_contents(soup, prefix):
     header_ids = Counter()
     headers = soup.findAll(header_re)
     if not headers:
@@ -306,7 +314,7 @@ def inject_table_of_contents(soup, prefix):
         
         header['id'] = aid
         
-        li = Tag(soup, "li")
+        li = Tag(soup, "li", [("class", aid)])
         a = Tag(soup, "a", [("href", "#%s" % aid)])
         a.string = contents
         li.append(a)
@@ -327,7 +335,8 @@ def inject_table_of_contents(soup, prefix):
         previous = thislevel
         parent.append(li)
     
-    soup.insert(0, tocdiv)
+    return tocdiv
+
 
 def keep_space(text):
     text = websafe(text)

@@ -21,72 +21,66 @@
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from ez_setup import use_setuptools
-use_setuptools()
-
-from setuptools import find_packages
-from distutils.core import setup, Extension
 import os
 import fnmatch
+import sys
+
+
+try:
+    import pkg_resources
+except ImportError:
+    print "Distribute >= 0.6.16 is required to run this."
+    sys.exit(1)
+else:
+    pkg_resources.require("distribute>=0.6.16")
+
+
+from setuptools import setup, find_packages, Extension
 
 
 commands = {}
 
 
 try:
-    from Cython.Distutils import build_ext
+    import r2.lib.translation
 except ImportError:
     pass
 else:
-    commands.update({
-        "build_ext": build_ext
-    })
+    commands["extract_messages"] = r2.lib.translation.extract_messages
 
 
 try:
-    from babel.messages import frontend as babel
-    commands.update({
-        "compile_catalog": babel.compile_catalog,
-        "extract_messages": babel.extract_messages,
-        "init_catalog": babel.init_catalog,
-        "update_catalog": babel.update_catalog,
-    })
+    from Cython.Build import cythonize
 except ImportError:
-    pass
+    print "Cannot find Cython. Skipping Cython build."
+    pyx_extensions = []
+else:
+    pyx_files = []
+    for root, directories, files in os.walk('.'):
+        for f in fnmatch.filter(files, '*.pyx'):
+            pyx_files.append(os.path.join(root, f))
+    pyx_extensions = cythonize(pyx_files)
 
-
-# add the cython modules
-pyx_extensions = []
-for root, directories, files in os.walk('.'):
-    for f in fnmatch.filter(files, '*.pyx'):
-        path = os.path.join(root, f)
-        module_name, _ = os.path.splitext(path)
-        module_name = os.path.normpath(module_name)
-        module_name = module_name.replace(os.sep, '.')
-        pyx_extensions.append(Extension(module_name, [path]))
-
-
-discount_path = "r2/lib/contrib/discount"
 
 setup(
     name="r2",
     version="",
     install_requires=[
         "webob==1.0.8",
+        "webtest<=1.4.3",  # anything newer requires WebOb>=1.2.0
         "Pylons==0.9.7",
         "Routes==1.11",
         "mako>=0.5",
         "boto >= 2.0",
         "pytz",
         "pycrypto",
-        "Babel>=0.9.1",
+        "Babel>=1.0",
         "cython>=0.14",
         "SQLAlchemy==0.7.4",
         "BeautifulSoup",
         "cssutils==0.9.5.1",
         "chardet",
         "psycopg2",
-        "pycountry",
         "pycassa>=1.7.0",
         "PIL",
         "pycaptcha",
@@ -98,9 +92,11 @@ setup(
         "lxml",
         "kazoo",
         "stripe",
+        "requests",
     ],
     dependency_links=[
         "https://github.com/reddit/snudown/archive/v1.1.3.tar.gz#egg=snudown-1.1.3",
+        "https://s3.amazonaws.com/code.reddit.com/pycaptcha-0.4.tar.gz#egg=pycaptcha-0.4",
     ],
     packages=find_packages(exclude=["ez_setup"]),
     cmdclass=commands,
@@ -120,5 +116,8 @@ setup(
     shell = pylons.commands:ShellCommand
     [paste.filter_app_factory]
     gzip = r2.lib.gzipper:make_gzip_middleware
+    [r2.provider.media]
+    s3 = r2.lib.providers.media.s3:S3MediaProvider
+    filesystem = r2.lib.providers.media.filesystem:FileSystemMediaProvider
     """,
 )

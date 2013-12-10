@@ -22,7 +22,6 @@
 
 import collections
 import json
-import locale
 import re
 import simplejson
 import socket
@@ -54,13 +53,15 @@ from r2.lib.errors import (
     BadRequestError,
     ForbiddenError,
     errors,
+    reddit_http_error,
 )
-from r2.lib.filters import _force_utf8
+from r2.lib.filters import _force_utf8, _force_unicode
 from r2.lib.strings import strings
 from r2.lib.template_helpers import add_sr, JSPreload
 from r2.lib.tracking import encrypt, decrypt
 from r2.lib.translation import set_lang
 from r2.lib.utils import (
+    Enum,
     SimpleSillyStub,
     UniqueIterator,
     http_utils,
@@ -90,6 +91,7 @@ from r2.models import (
     FakeSubreddit,
     Friends,
     Frontpage,
+    LabeledMulti,
     Link,
     MultiReddit,
     NotFound,
@@ -102,10 +104,35 @@ from r2.models import (
     valid_feed,
     valid_otp_cookie,
 )
+from r2.lib.db import tdb_cassandra
 
 
 NEVER = datetime(2037, 12, 31, 23, 59, 59)
 DELETE = datetime(1970, 01, 01, 0, 0, 1)
+PAGECACHE_POLICY = Enum(
+    # logged in users may use the pagecache as well.
+    "LOGGEDIN_AND_LOGGEDOUT",
+    # only attempt to use pagecache if the current user is not logged in.
+    "LOGGEDOUT_ONLY",
+    # do not use pagecache.
+    "NEVER",
+)
+
+
+def pagecache_policy(policy):
+    """Decorate a controller method to specify desired pagecache behaviour.
+
+    If not specified, the policy will default to LOGGEDOUT_ONLY.
+
+    """
+
+    assert policy in PAGECACHE_POLICY
+
+    def pagecache_decorator(fn):
+        fn.pagecache_policy = policy
+        return fn
+    return pagecache_decorator
+
 
 cache_affecting_cookies = ('over18', '_options')
 
@@ -147,6 +174,8 @@ class Cookie(object):
             return "clicks"
         elif cookie_name.startswith("__utm"):
             return "ga"
+        elif cookie_name.startswith("beta_"):
+            return "beta"
         else:
             return "other"
 
@@ -288,9 +317,8 @@ def delete_obsolete_cookies():
             c.cookies[cookie_name] = Cookie("", expires=DELETE)
 
 def over18():
-    if c.user.pref_over_18 or c.user_is_admin:
-        return True
-
+    if c.user_is_loggedin:
+        return c.user.pref_over_18 or c.user_is_admin
     else:
         if 'over18' in c.cookies:
             cookie = c.cookies['over18'].value
@@ -303,6 +331,7 @@ def set_obey_over18():
     "querystring parameter for API to obey over18 filtering rules"
     c.obey_over18 = request.GET.get("obey_over18") == "true"
 
+valid_ascii_domain = re.compile(r'\A(\w[-\w]*\.)+[\w]+\Z')
 def set_subreddit():
     #the r parameter gets added by javascript for POST requests so we
     #can reference c.site in api.py
@@ -333,12 +362,13 @@ def set_subreddit():
             c.site = Friends
         else:
             srs = [sr for sr in srs if not isinstance(sr, FakeSubreddit)]
+            multi_path = '/r/' + sr_name
             if not srs:
-                c.site = MultiReddit([], sr_name)
+                c.site = MultiReddit(multi_path, [])
             elif len(srs) == 1:
                 c.site = srs[0]
             else:
-                c.site = MultiReddit(srs, sr_name)
+                c.site = MultiReddit(multi_path, srs)
     elif '-' in sr_name:
         sr_names = sr_name.split('-')
         if not sr_names[0].lower() == All.name.lower():
@@ -361,10 +391,48 @@ def set_subreddit():
 
     #if we didn't find a subreddit, check for a domain listing
     if not sr_name and isinstance(c.site, DefaultSR) and domain:
+        # Redirect IDN to their IDNA name if necessary
+        try:
+            idna = _force_unicode(domain).encode("idna")
+            if idna != domain:
+                redirect_to("/domain/%s%s" % (idna, request.environ["PATH_INFO"]))
+        except UnicodeError:
+            domain = ''  # Ensure valid_ascii_domain fails
+        if not c.error_page and not valid_ascii_domain.match(domain):
+            abort(404)
         c.site = DomainSR(domain)
 
     if isinstance(c.site, FakeSubreddit):
         c.default_sr = True
+
+
+def set_multireddit():
+    routes_dict = request.environ["pylons.routes_dict"]
+    if "multipath" in routes_dict:
+        multipath = routes_dict["multipath"].lower()
+        multi_id = None
+
+        if c.user_is_loggedin and routes_dict.get("my_multi"):
+            multi_id = "/user/%s/m/%s" % (c.user.name.lower(), multipath)
+        elif "username" in routes_dict:
+            username = routes_dict["username"].lower()
+
+            if c.user_is_loggedin:
+                # redirect /user/foo/m/... to /me/m/... for user foo.
+                if username == c.user.name.lower():
+                    # trim off multi id
+                    url_parts = request.path_qs.split("/")[5:]
+                    url_parts.insert(0, "/me/m/%s" % multipath)
+                    abort(302, location="/".join(url_parts))
+
+            multi_id = "/user/%s/m/%s" % (username, multipath)
+
+        if multi_id:
+            try:
+                c.site = LabeledMulti._byID(multi_id)
+            except tdb_cassandra.NotFound:
+                abort(404)
+
 
 def set_content_type():
     e = request.environ
@@ -373,11 +441,15 @@ def set_content_type():
 
     if e.has_key('extension'):
         c.extension = ext = e['extension']
-        if ext in ('embed', 'wired', 'widget'):
+        if ext in ('embed', 'widget'):
             wrapper = request.params.get("callback", "document.write")
             wrapper = filters._force_utf8(wrapper)
             if not valid_jsonp_callback(wrapper):
                 abort(BadRequestError(errors.BAD_JSONP_CALLBACK))
+
+            # force logged-out state since these can be accessed cross-domain
+            c.user = UnloggedUser(get_browser_langs())
+            c.user_is_loggedin = False
 
             def to_js(content):
                 return wrapper + "(" + utils.string2js(content) + ");"
@@ -409,6 +481,7 @@ def set_content_type():
         c.allowed_callback = callback
         c.user = UnloggedUser(get_browser_langs())
         c.user_is_loggedin = False
+        response.content_type = "application/javascript"
 
 def get_browser_langs():
     browser_langs = []
@@ -431,40 +504,23 @@ def get_browser_langs():
                 seen_langs.add(l)
     return browser_langs
 
-def set_host_lang():
-    # try to grab the language from the domain
-    host_lang = request.environ.get('reddit-prefer-lang')
-    if host_lang:
-        c.host_lang = host_lang
-
 def set_iface_lang():
-    locale.setlocale(locale.LC_ALL, g.locale)
-    lang = [g.lang]
-    # GET param wins
-    if c.host_lang:
-        lang = [c.host_lang]
-    else:
-        lang = [c.user.pref_lang]
+    host_lang = request.environ.get('reddit-prefer-lang')
+    lang = host_lang or c.user.pref_lang
 
-    if getattr(g, "lang_override") and lang[0] == "en":
-        lang.insert(0, g.lang_override)
+    if getattr(g, "lang_override") and lang.startswith("en"):
+        lang = g.lang_override
 
-    #choose the first language
-    c.lang = lang[0]
-
-    #then try to overwrite it if we have the translation for another
-    #one
-    for l in lang:
-        try:
-            set_lang(l, fallback_lang=g.lang)
-            c.lang = l
-            break
-        except LanguageError:
-            #we don't have a translation for that language
-            set_lang(g.lang, graceful_fail=True)
+    c.lang = lang
 
     try:
-        c.locale = babel.core.Locale.parse(c.lang, sep='-')
+        set_lang(lang, fallback_lang=g.lang)
+    except LanguageError:
+        lang = g.lang
+        set_lang(lang, graceful_fail=True)
+
+    try:
+        c.locale = babel.core.Locale.parse(lang, sep='-')
     except (babel.core.UnknownLocaleError, ValueError):
         c.locale = babel.core.Locale.parse(g.lang, sep='-')
 
@@ -492,24 +548,24 @@ def set_colors():
     theme_rx = re.compile(r'')
     color_rx = re.compile(r'\A([a-fA-F0-9]){3}(([a-fA-F0-9]){3})?\Z')
     c.theme = None
-    if color_rx.match(request.get.get('bgcolor') or ''):
-        c.bgcolor = request.get.get('bgcolor')
-    if color_rx.match(request.get.get('bordercolor') or ''):
-        c.bordercolor = request.get.get('bordercolor')
+    if color_rx.match(request.GET.get('bgcolor') or ''):
+        c.bgcolor = request.GET.get('bgcolor')
+    if color_rx.match(request.GET.get('bordercolor') or ''):
+        c.bordercolor = request.GET.get('bordercolor')
 
 
-def ratelimit_agent(agent):
-    SLICE_SIZE = 10
-    slice, remainder = map(int, divmod(time.time(), SLICE_SIZE))
-    time_slice = time.gmtime(slice * SLICE_SIZE)
+def ratelimit_agent(agent, limit=10, slice_size=10):
+    slice_size = min(slice_size, 60)
+    slice, remainder = map(int, divmod(time.time(), slice_size))
+    time_slice = time.gmtime(slice * slice_size)
     key = "rate_agent_" + agent + time.strftime("_%S", time_slice)
 
-    g.cache.add(key, 0, time=SLICE_SIZE + 1)
-    if g.cache.incr(key) > SLICE_SIZE:
-        request.environ['retry_after'] = SLICE_SIZE - remainder
+    g.cache.add(key, 0, time=slice_size + 1)
+    if g.cache.incr(key) > limit:
+        request.environ['retry_after'] = slice_size - remainder
         abort(429)
 
-appengine_re = re.compile(r'AppEngine-Google; \(\+http://code.google.com/appengine; appid: s~([a-z0-9-]{6,30})\)\Z')
+appengine_re = re.compile(r'AppEngine-Google; \(\+http://code.google.com/appengine; appid: (?:dev|s)~([a-z0-9-]{6,30})\)\Z')
 def ratelimit_agents():
     user_agent = request.user_agent
 
@@ -517,16 +573,17 @@ def ratelimit_agents():
         return
 
     # parse out the appid for appengine apps
-    appengine_match = appengine_re.match(user_agent)
+    appengine_match = appengine_re.search(user_agent)
     if appengine_match:
         appid = appengine_match.group(1)
         ratelimit_agent(appid)
         return
 
     user_agent = user_agent.lower()
-    for s in g.agents:
-        if s and user_agent and s in user_agent:
-            ratelimit_agent(s)
+    for agent, limit in g.agents.iteritems():
+        if agent in user_agent:
+            ratelimit_agent(agent, limit)
+            return
 
 def ratelimit_throttled():
     ip = request.ip.strip()
@@ -542,7 +599,9 @@ def paginated_listing(default_page_size=25, max_page_size=100, backend='sql'):
                   before=VByName('before', backend=backend),
                   count=VCount('count'),
                   target=VTarget("target"),
-                  show=VLength('show', 3))
+                  show=VLength('show', 3, empty_error=None,
+                               docs={"show": "(optional) the string `all`"}),
+        )
         @wraps(fn)
         def new_fn(self, before, **env):
             if c.render_style == "htmllite":
@@ -561,8 +620,14 @@ def paginated_listing(default_page_size=25, max_page_size=100, backend='sql'):
                 kw['reverse'] = True
 
             return fn(self, **kw)
+
+        if hasattr(fn, "_api_doc"):
+            fn._api_doc["notes"] = paginated_listing.doc_note
+
         return new_fn
     return decorator
+
+paginated_listing.doc_note = "*This endpoint is [a listing](#listings).*"
 
 #TODO i want to get rid of this function. once the listings in front.py are
 #moved into listingcontroller, we shouldn't have a need for this
@@ -610,13 +675,11 @@ def require_https():
     if not c.secure:
         abort(ForbiddenError(errors.HTTPS_REQUIRED))
 
-def prevent_framing_and_css(allow_cname_frame=False):
+def disable_subreddit_css():
     def wrap(f):
         @wraps(f)
         def no_funny_business(*args, **kwargs):
             c.allow_styles = False
-            if not (allow_cname_frame and c.cname and not c.authorized_cname):
-                c.deny_frames = True
             return f(*args, **kwargs)
         return no_funny_business
     return wrap
@@ -631,6 +694,18 @@ def flatten_response(content):
     # TODO: it would be nice to replace this with response.body someday
     # once unicode issues are ironed out.
     return "".join(_force_utf8(x) for x in tup(content) if x)
+
+
+def abort_with_error(error):
+    if not error.code:
+        raise ValueError('Error %r missing status code' % error)
+
+    abort(reddit_http_error(
+        code=error.code,
+        error_name=error.name,
+        explanation=error.message,
+        fields=error.fields,
+    ))
 
 
 class MinimalController(BaseController):
@@ -664,6 +739,8 @@ class MinimalController(BaseController):
     def pre(self):
         action = request.environ["pylons.routes_dict"].get("action")
         if action:
+            if not self._get_action_handler():
+                action = 'invalid'
             c.request_timer = g.stats.get_timer(request_timer_name(action))
         else:
             c.request_timer = SimpleSillyStub()
@@ -675,18 +752,8 @@ class MinimalController(BaseController):
 
         c.domain_prefix = request.environ.get("reddit-domain-prefix",
                                               g.domain_prefix)
-        c.secure = request.host in g.secure_domains
-
-        # wsgi.url_scheme is used in generating absolute urls, such as by webob
-        # for translating some of our relative-url redirects to rfc compliant
-        # absolute-url ones. TODO: consider using one of webob's methods of
-        # setting wsgi.url_scheme based on incoming request headers added by
-        # upstream things like stunnel/haproxy.
-        if c.secure:
-            request.environ["wsgi.url_scheme"] = "https"
-
-        url = urlparse(request.url)
-        c.request_origin = url.scheme + "://" + url.netloc
+        c.secure = request.environ["wsgi.url_scheme"] == "https"
+        c.request_origin = request.host_url
 
         #check if user-agent needs a dose of rate-limiting
         if not c.error_page:
@@ -694,6 +761,7 @@ class MinimalController(BaseController):
             ratelimit_agents()
 
         c.allow_loggedin_cache = False
+        c.allow_framing = False
 
         # the domain has to be set before Cookies get initialized
         set_subreddit()
@@ -709,10 +777,31 @@ class MinimalController(BaseController):
 
         g.stats.count_string('user_agents', request.user_agent)
 
+        hooks.get_hook("reddit.request.minimal_begin").call()
+
+    def can_use_pagecache(self):
+        handler = self._get_action_handler()
+        policy = getattr(handler, "pagecache_policy",
+                         PAGECACHE_POLICY.LOGGEDOUT_ONLY)
+
+        if policy == PAGECACHE_POLICY.LOGGEDIN_AND_LOGGEDOUT:
+            return True
+        elif policy == PAGECACHE_POLICY.LOGGEDOUT_ONLY:
+            return not c.user_is_loggedin
+
+        return False
+
     def try_pagecache(self):
-        #check content cache
-        if request.method.upper() == 'GET' and not c.user_is_loggedin:
-            r = g.pagecache.get(self.request_key())
+        c.can_use_pagecache = self.can_use_pagecache()
+
+        if request.method.upper() == 'GET' and c.can_use_pagecache:
+            request_key = self.request_key()
+            try:
+                r = g.pagecache.get(request_key)
+            except MemcachedError as e:
+                g.log.warning("pagecache error: %s", e)
+                return
+
             if r:
                 r, c.cookies = r
                 response.headers = r.headers
@@ -742,15 +831,19 @@ class MinimalController(BaseController):
             response.headers['Cache-Control'] = 'no-cache'
             response.headers['Pragma'] = 'no-cache'
 
-        if c.deny_frames:
-            response.headers["X-Frame-Options"] = "DENY"
+        # pagecache stores headers. we need to not add X-Frame-Options to
+        # cached requests (such as media embeds) that intend to allow framing.
+        if not c.allow_framing and not c.used_cache:
+            response.headers["X-Frame-Options"] = "SAMEORIGIN"
 
-        #set content cache
+        # save the result of this page to the pagecache if possible.  we
+        # mustn't cache things that rely on state not tracked by request_key
+        # such as If-Modified-Since headers for 304s or requesting IP for 429s.
         if (g.page_cache_time
             and request.method.upper() == 'GET'
-            and (not c.user_is_loggedin or c.allow_loggedin_cache)
+            and c.can_use_pagecache
             and not c.used_cache
-            and response.status_int != 429
+            and response.status_int not in (304, 429)
             and not response.status.startswith("5")
             and not c.is_exception_response):
             try:
@@ -762,6 +855,15 @@ class MinimalController(BaseController):
                 # the pagecache memcached client is in no_reply mode.
                 g.log.warning("Ignored exception (%r) on pagecache "
                               "write for %r", e, request.path)
+
+        pragmas = [p.strip() for p in
+                   request.headers.get("Pragma", "").split(",")]
+        if g.debug or "x-reddit-pagecache" in pragmas:
+            if c.can_use_pagecache:
+                pagecache_state = "hit" if c.used_cache else "miss"
+            else:
+                pagecache_state = "disallowed"
+            response.headers["X-Reddit-Pagecache"] = pagecache_state
 
         # send cookies
         for k, v in c.cookies.iteritems():
@@ -829,7 +931,7 @@ class MinimalController(BaseController):
         self.check_cors()
 
     def update_qstring(self, dict):
-        merged = copy(request.get)
+        merged = copy(request.GET)
         merged.update(dict)
         return request.path + utils.query_string(merged)
 
@@ -966,8 +1068,10 @@ class RedditController(MinimalController):
         c.over18 = over18()
         set_obey_over18()
 
+        # looking up the multireddit requires c.user.
+        set_multireddit()
+
         #set_browser_langs()
-        set_host_lang()
         set_iface_lang()
         set_content_lang()
         set_recent_clicks()
@@ -981,16 +1085,16 @@ class RedditController(MinimalController):
         # random reddit trickery -- have to do this after the content lang is set
         if c.site == Random:
             c.site = Subreddit.random_reddit(user=c.user)
-            redirect_to("/" + c.site.path.strip('/') + request.path)
+            redirect_to("/" + c.site.path.strip('/') + request.path_qs)
         elif c.site == RandomSubscription:
             if c.user.gold:
                 c.site = Subreddit.random_subscription(c.user)
-                redirect_to('/' + c.site.path.strip('/') + request.path)
+                redirect_to('/' + c.site.path.strip('/') + request.path_qs)
             else:
                 redirect_to('/gold/about')
         elif c.site == RandomNSFW:
             c.site = Subreddit.random_reddit(over18=True, user=c.user)
-            redirect_to("/" + c.site.path.strip('/') + request.path)
+            redirect_to("/" + c.site.path.strip('/') + request.path_qs)
 
         if not request.path.startswith("/api/login/"):
             # is the subreddit banned?
@@ -1014,19 +1118,25 @@ class RedditController(MinimalController):
 
             # check if the user has access to this subreddit
             if not c.site.can_view(c.user) and not c.error_page:
-                public_description = c.site.public_description
-                errpage = pages.RedditError(strings.private_subreddit_title,
-                                            strings.private_subreddit_message,
-                                            image="subreddit-private.png",
-                                            sr_description=public_description)
-                request.environ['usable_error_content'] = errpage.render()
-                self.abort403()
+                if isinstance(c.site, LabeledMulti):
+                    # do not leak the existence of multis via 403.
+                    self.abort404()
+                else:
+                    public_description = c.site.public_description
+                    errpage = pages.RedditError(
+                        strings.private_subreddit_title,
+                        strings.private_subreddit_message,
+                        image="subreddit-private.png",
+                        sr_description=public_description,
+                    )
+                    request.environ['usable_error_content'] = errpage.render()
+                    self.abort403()
 
             #check over 18
             if (c.site.over_18 and not c.over18 and
                 request.path not in ("/frame", "/over18")
                 and c.render_style == 'html'):
-                return self.intermediate_redirect("/over18")
+                return self.intermediate_redirect("/over18", sr_path=False)
 
         #check whether to allow custom styles
         c.allow_styles = True
@@ -1040,6 +1150,8 @@ class RedditController(MinimalController):
         elif c.site.domain and c.site.css_on_cname and not c.cname:
             c.can_apply_styles = False
 
+        c.bare_content = request.GET.pop('bare', False)
+
         c.show_admin_bar = admin_bar_eligible and (c.user_is_admin or g.debug)
         if not c.show_admin_bar:
             g.stats.end_logging_timings()
@@ -1051,6 +1163,16 @@ class RedditController(MinimalController):
     def post(self):
         MinimalController.post(self)
         self._embed_html_timing_data()
+
+        # allow logged-out JSON requests to be read cross-domain
+        if (request.method.upper() == "GET" and not c.user_is_loggedin and
+            c.render_style == "api"):
+            response.headers["Access-Control-Allow-Origin"] = "*"
+
+            request_origin = request.headers.get('Origin')
+            if request_origin and request_origin != g.origin:
+                g.stats.simple_event('cors.api_request')
+                g.stats.count_string('origins', request_origin)
 
     def _embed_html_timing_data(self):
         timings = g.stats.end_logging_timings()

@@ -53,6 +53,7 @@ menu =   MenuHandler(hot          = _('hot'),
                      more         = _('more'),
                      relevance    = _('relevance'),
                      controversial  = _('controversial'),
+                     gilded       = _('gilded'),
                      confidence   = _('best'),
                      random       = _('random'),
                      saved        = _('saved {toolbar}'),
@@ -80,7 +81,7 @@ menu =   MenuHandler(hot          = _('hot'),
                      logout       = _("logout"),
                      
                      #reddit footer strings
-                     feedback     = _("contact us"),
+                     contact    = _("contact us"),
                      buttons      = _("buttons"),
                      widget       = _("widget"), 
                      code         = _("source code"),
@@ -145,7 +146,7 @@ menu =   MenuHandler(hot          = _('hot'),
                      ads          = _("ads"),
                      promoted     = _("promoted"),
                      reporters    = _("reporters"),
-                     reports      = _("reported links"),
+                     reports      = _("reports"),
                      reportedauth = _("reported authors"),
                      info         = _("info"),
                      share        = _("share"),
@@ -157,15 +158,16 @@ menu =   MenuHandler(hot          = _('hot'),
                      hidden       = _("hidden {toolbar}"),
                      deleted      = _("deleted"),
                      reported     = _("reported"),
+                     voting       = _("voting"),
 
                      promote        = _('self-serve advertising'),
                      new_promo      = _('create promotion'),
                      my_current_promos = _('my promoted links'),
                      current_promos = _('all promoted links'),
+                     all_promos     = _('all'),
                      future_promos  = _('unseen'),
                      roadblock      = _('roadblock'),
-                     graph          = _('analytics'),
-                     admin_graph = _('admin analytics'),
+                     inventory      = _('inventory'),
                      live_promos    = _('live'),
                      unpaid_promos  = _('unpaid'),
                      pending_promos = _('pending'),
@@ -303,6 +305,9 @@ class NavButton(Styled):
         else:
             if self.stripped_path == self.bare_path:
                 return True
+            site_path = c.site.user_path.lower() + self.bare_path
+            if self.sr_path and self.stripped_path == site_path:
+                return True
             if self.bare_path and self.stripped_path.startswith(self.bare_path):
                 return True
             if self.stripped_path in self.aliases:
@@ -350,7 +355,7 @@ class SubredditButton(NavButton):
                            isselected = (c.site == sr), **kw)
 
     def build(self, base_path = ''):
-        pass
+        self.bare_path = ""
 
     def is_selected(self):
         return self.isselected

@@ -31,6 +31,8 @@ from r2.models.printable import Printable
 from r2.models.account import Account
 from collections import OrderedDict
 
+import pycassa.types
+
 # Used for the key/id for pages,
 PAGE_ID_SEP = '\t'
 
@@ -48,12 +50,20 @@ impossible_namespaces = ('edit/', 'revisions/', 'settings/', 'discussions/',
 restricted_namespaces = ('reddit/', 'config/', 'special/')
 
 # Pages which may only be edited by mods, must be within restricted namespaces
-special_pages = ('config/stylesheet', 'config/sidebar', 'config/description')
+special_pages = ('config/stylesheet', 'config/sidebar',
+                 'config/submit_text', 'config/description')
 
 # Pages which have a special length restrictions (In bytes)
-special_length_restrictions_bytes = {'config/stylesheet': 128*1024, 'config/sidebar': 5120, 'config/description': 500}
+special_length_restrictions_bytes = {
+    'config/stylesheet': 128*1024,
+    'config/submit_text': 1024,
+    'config/sidebar': 5120,
+    'config/description': 500
+}
 
-modactions = {'config/sidebar': "Updated subreddit sidebar"}
+modactions = {'config/sidebar': "Updated subreddit sidebar",
+              'config/submit_text': "Updated submission text",
+              'config/description': "Updated subreddit description"}
 
 # Page "index" in the subreddit "reddit.com" and a seperator of "\t" becomes:
 #   "reddit.com\tindex"
@@ -82,7 +92,7 @@ class WikiRevision(tdb_cassandra.UuidThing, Printable):
     _str_props = ('pageid', 'content', 'author', 'reason')
     _bool_props = ('hidden')
     
-    cache_ignore = set(list(_str_props)).union(Printable.cache_ignore)
+    cache_ignore = set(list(_str_props)).union(Printable.cache_ignore).union(['wikipage'])
     
     def get_author(self):
         author = self._get('author')
@@ -98,15 +108,18 @@ class WikiRevision(tdb_cassandra.UuidThing, Printable):
     def get_printable_authors(cls, revisions):
         from r2.lib.pages import WrappedUser
         authors = cls.get_authors(revisions)
-        return dict([(v._id36, WrappedUser(v))
-                     for v in authors.itervalues() if v])
+        return dict([(id36, WrappedUser(v))
+                     for id36, v in authors.iteritems() if v])
     
     @classmethod
     def add_props(cls, user, wrapped):
         authors = cls.get_printable_authors(wrapped)
+        pages = {r.page: None for r in wrapped}
+        pages = WikiPage.get_multiple((c.site, page) for page in pages)
         for item in wrapped:
             item._hidden = item.is_hidden
             item._spam = False
+            item.wikipage = pages[item.pageid]
             author = item._get('author')
             item.printable_author = authors.get(author, '[unknown]')
             item.reported = False
@@ -187,11 +200,24 @@ class WikiPage(tdb_cassandra.Thing):
         return None
     
     @classmethod
-    def get(cls, sr, name):
+    def id_for(cls, sr, name):
         id = getattr(sr, '_id36', None)
         if not id:
             raise tdb_cassandra.NotFound
-        return cls._byID(wiki_id(id, name))
+        return wiki_id(id, name)
+    
+    @classmethod
+    def get_multiple(cls, pages):
+        """Get multiple wiki pages.
+        
+        Arguments:
+        pages -- list of tuples in the form of [(sr, names),..]
+        """
+        return cls._byID([cls.id_for(sr, name) for sr, name in pages])
+    
+    @classmethod
+    def get(cls, sr, name):
+        return cls._byID(cls.id_for(sr, name))
     
     @classmethod
     def create(cls, sr, name):
@@ -324,7 +350,7 @@ class WikiPage(tdb_cassandra.Thing):
         self.content = content
         self.last_edit_by = author
         self.last_edit_date = wr.date
-        self.revision = wr._id
+        self.revision = str(wr._id)
         self._commit()
         return wr
     
@@ -385,3 +411,36 @@ class WikiRevisionsRecentBySR(tdb_cassandra.DenormalizedView):
         return wr.sr
 
 
+class ImagesByWikiPage(tdb_cassandra.View):
+    _use_db = True
+    _read_consistency_level = tdb_cassandra.CL.QUORUM
+    _write_consistency_level = tdb_cassandra.CL.QUORUM
+    _extra_schema_creation_args = {
+        "key_validation_class": pycassa.types.AsciiType(),
+        "column_name_class": pycassa.types.UTF8Type(),
+        "default_validation_class": pycassa.types.UTF8Type(),
+    }
+
+    @classmethod
+    def add_image(cls, sr, page_name, image_name, url):
+        rowkey = WikiPage.id_for(sr, page_name)
+        cls._set_values(rowkey, {image_name: url})
+
+    @classmethod
+    def get_images(cls, sr, page_name):
+        try:
+            rowkey = WikiPage.id_for(sr, page_name)
+            return cls._byID(rowkey)._values()
+        except tdb_cassandra.NotFound:
+            return {}
+
+    @classmethod
+    def get_image_count(cls, sr, page_name):
+        rowkey = WikiPage.id_for(sr, page_name)
+        return cls._cf.get_count(rowkey,
+            read_consistency_level=cls._read_consistency_level)
+
+    @classmethod
+    def delete_image(cls, sr, page_name, image_name):
+        rowkey = WikiPage.id_for(sr, page_name)
+        cls._remove(rowkey, [image_name])

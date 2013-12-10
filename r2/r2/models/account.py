@@ -29,9 +29,8 @@ from r2.lib.utils        import modhash, valid_hash, randstr, timefromnow
 from r2.lib.utils        import UrlParser
 from r2.lib.utils        import constant_time_compare, canonicalize_email
 from r2.lib.cache        import sgm
-from r2.lib import filters
+from r2.lib import filters, hooks
 from r2.lib.log import log_text
-from r2.lib.zookeeper import LiveDict
 from r2.models.last_modified import LastModified
 
 from pylons import c, g, request
@@ -43,6 +42,7 @@ from datetime import datetime, timedelta
 import bcrypt
 import hmac
 import hashlib
+import itertools
 from pycassa.system_manager import ASCII_TYPE
 
 
@@ -63,6 +63,7 @@ class Account(Thing):
                      pref_frame_commentspanel = False,
                      pref_newwindow = False,
                      pref_clickgadget = 5,
+                     pref_store_visits = False,
                      pref_public_votes = False,
                      pref_hide_from_robots = False,
                      pref_research = False,
@@ -75,6 +76,7 @@ class Account(Thing):
                      pref_content_langs = (g.lang,),
                      pref_over_18 = False,
                      pref_compress = False,
+                     pref_domain_details = False,
                      pref_organic = True,
                      pref_no_profanity = True,
                      pref_label_nsfw = True,
@@ -90,6 +92,9 @@ class Account(Thing):
                      pref_show_sponsors = True, # sponsored links
                      pref_show_sponsorships = True,
                      pref_highlight_new_comments = True,
+                     pref_monitor_mentions=True,
+                     pref_collapse_left_bar=False,
+                     pref_public_server_seconds=False,
                      mobile_compress = False,
                      mobile_thumbnail = True,
                      trusted_sponsor = False,
@@ -111,6 +116,7 @@ class Account(Thing):
                      gold_charter = False,
                      gold_creddits = 0,
                      gold_creddit_escrow = 0,
+                     cake_expiration=None,
                      otp_secret=None,
                      state=0,
                      )
@@ -233,7 +239,7 @@ class Account(Thing):
             self._load()
         timestr = timestr or time.strftime(COOKIE_TIMESTAMP_FORMAT)
         id_time = str(self._id) + ',' + timestr
-        to_hash = ','.join((id_time, self.password, g.SECRET))
+        to_hash = ','.join((id_time, self.password, g.secrets["SECRET"]))
         return id_time + ',' + hashlib.sha1(to_hash).hexdigest()
 
     def make_admin_cookie(self, first_login=None, last_request=None):
@@ -242,7 +248,7 @@ class Account(Thing):
         first_login = first_login or datetime.utcnow().strftime(COOKIE_TIMESTAMP_FORMAT)
         last_request = last_request or datetime.utcnow().strftime(COOKIE_TIMESTAMP_FORMAT)
         hashable = ','.join((first_login, last_request, request.ip, request.user_agent, self.password))
-        mac = hmac.new(g.SECRET, hashable, hashlib.sha1).hexdigest()
+        mac = hmac.new(g.secrets["SECRET"], hashable, hashlib.sha1).hexdigest()
         return ','.join((first_login, last_request, mac))
 
     def make_otp_cookie(self, timestamp=None):
@@ -251,7 +257,7 @@ class Account(Thing):
 
         timestamp = timestamp or datetime.utcnow().strftime(COOKIE_TIMESTAMP_FORMAT)
         secrets = [request.user_agent, self.otp_secret, self.password]
-        signature = hmac.new(g.SECRET, ','.join([timestamp] + secrets), hashlib.sha1).hexdigest()
+        signature = hmac.new(g.secrets["SECRET"], ','.join([timestamp] + secrets), hashlib.sha1).hexdigest()
 
         return ",".join((timestamp, signature))
 
@@ -351,6 +357,7 @@ class Account(Thing):
 
     def delete(self, delete_message=None):
         self.delete_message = delete_message
+        self.delete_time = datetime.now(g.tz)
         self._deleted = True
         self._commit()
 
@@ -441,43 +448,6 @@ class Account(Thing):
 
         self.share = share
 
-    def set_cup(self, cup_info):
-        from r2.lib.template_helpers import static
-
-        if cup_info is None:
-            return
-
-        if cup_info.get("expiration", None) is None:
-            return
-
-        cup_info.setdefault("label_template",
-          "%(user)s recently won a trophy! click here to see it.")
-
-        cup_info.setdefault("img_url", static('award.png'))
-
-        existing_info = self.cup_info()
-
-        if (existing_info and
-            existing_info["expiration"] > cup_info["expiration"]):
-            # The existing award has a later expiration,
-            # so it trumps the new one as far as cups go
-            return
-
-        td = cup_info["expiration"] - timefromnow("0 seconds")
-
-        cache_lifetime = td.seconds
-
-        if cache_lifetime <= 0:
-            g.log.error("Adding a cup that's already expired?")
-        else:
-            g.hardcache.set("cup_info-%d" % self._id, cup_info, cache_lifetime)
-
-    def remove_cup(self):
-        g.hardcache.delete("cup_info-%d" % self._id)
-
-    def cup_info(self):
-        return g.hardcache.get("cup_info-%d" % self._id)
-
     def special_distinguish(self):
         if self._t.get("special_distinguish_name"):
             return dict((k, self._t.get("special_distinguish_"+k, None))
@@ -519,17 +489,17 @@ class Account(Thing):
     # When true, returns the reason
     @classmethod
     def which_emails_are_banned(cls, canons):
-        banned = g.hardcache.get_multi(canons, prefix="email_banned-")
+        banned = hooks.get_hook('email.get_banned').call(canons=canons)
 
-        # Filter out all the ones that are simply banned by address.
-        # Of the remaining ones, create a dictionary like:
+        # Create a dictionary like:
         # d["abc.def.com"] = [ "bob@abc.def.com", "sue@abc.def.com" ]
         rv = {}
         canons_by_domain = {}
-        for canon in canons:
-            if banned.get(canon, False):
-                rv[canon] = "address"
-                continue
+
+        # email.get_banned will return a list of lists (one layer from the
+        # hooks system, the second from the function itself); chain them
+        # together for easy processing
+        for canon in itertools.chain(*banned):
             rv[canon] = None
 
             at_sign = canon.find("@")
@@ -537,21 +507,13 @@ class Account(Thing):
             canons_by_domain.setdefault(domain, [])
             canons_by_domain[domain].append(canon)
 
-        # Now, build a list of subdomains to check for ban status; for
-        # abc@foo.bar.com, we need to check foo.bar.com, bar.com, and .com
-        canons_by_subdomain = {}
-        for domain, canons in canons_by_domain.iteritems():
-            parts = domain.rstrip(".").split(".")
-            while len(parts) >= 1:
-                whole = ".".join(parts)
-                canons_by_subdomain.setdefault(whole, [])
-                canons_by_subdomain[whole].extend(canons)
-                parts.pop(0)
+        # Hand off to the domain ban system; it knows in the case of
+        # abc@foo.bar.com to check foo.bar.com, bar.com, and .com
+        from r2.models.admintools import bans_for_domain_parts
 
-        for subdomain, d in g.banned_domains.iteritems():
-            if(d and d.get("no_email", None) and
-                    subdomain in canons_by_subdomain):
-                for canon in canons_by_subdomain[subdomain]:
+        for domain, canons in canons_by_domain.iteritems():
+            for d in bans_for_domain_parts(domain):
+                if d.no_email:
                     rv[canon] = "domain"
 
         return rv
@@ -603,10 +565,6 @@ class Account(Thing):
         return filled_quota
 
     @classmethod
-    def cup_info_multi(cls, ids):
-        return g.hardcache.get_multi(ids, prefix="cup_info-")
-
-    @classmethod
     def system_user(cls):
         try:
             return cls._by_name(g.system_user)
@@ -614,7 +572,7 @@ class Account(Thing):
             return None
 
     def flair_enabled_in_sr(self, sr_id):
-        return getattr(self, 'flair_%d_enabled' % sr_id, True)
+        return getattr(self, 'flair_%s_enabled' % sr_id, True)
 
     def update_sr_activity(self, sr):
         if not self._spam:
@@ -636,6 +594,38 @@ class Account(Thing):
 
         '''
         return setattr(self, 'received_trophy_%s' % uid, trophy_id)
+
+    @property
+    def employee(self):
+        """Return if the user is an employee.
+
+        Being an employee grants them various special privileges.
+
+        """
+        return (hasattr(self, 'name') and
+                (self.name in g.admins or
+                 self.name in g.sponsors or
+                 self.name in g.employees))
+
+    @property
+    def cpm_selfserve_pennies(self):
+        return getattr(self, 'cpm_selfserve_pennies_override',
+                       g.cpm_selfserve.pennies)
+
+    @property
+    def has_gold_subscription(self):
+        return bool(getattr(self, 'gold_subscr_id', None))
+
+    @property
+    def has_paypal_subscription(self):
+        return (self.has_gold_subscription and
+                not self.gold_subscr_id.startswith('cus_'))
+
+    @property
+    def has_stripe_subscription(self):
+        return (self.has_gold_subscription and
+                self.gold_subscr_id.startswith('cus_'))
+
 
 class FakeAccount(Account):
     _nodb = True
@@ -713,7 +703,8 @@ def valid_feed(name, feedhash, path):
             pass
 
 def make_feedhash(user, path):
-    return hashlib.sha1("".join([user.name, user.password, g.FEEDSECRET])
+    return hashlib.sha1("".join([user.name, user.password,
+                                 g.secrets["FEEDSECRET"]])
                    ).hexdigest()
 
 def make_feedurl(user, path, ext = "rss"):

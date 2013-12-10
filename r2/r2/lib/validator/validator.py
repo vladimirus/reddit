@@ -20,6 +20,7 @@
 # Inc. All Rights Reserved.
 ###############################################################################
 
+import cgi
 import json
 
 from pylons import c, g, request, response
@@ -38,6 +39,7 @@ from r2.lib.permissions import ModeratorPermissionSet
 from r2.models import *
 from r2.lib.authorize import Address, CreditCard
 from r2.lib.utils import constant_time_compare
+from r2.lib.require import require, require_split, RequirementException
 
 from r2.lib.errors import errors, RedditError, UserRequiredException
 from r2.lib.errors import VerifiedUserRequiredException
@@ -53,10 +55,6 @@ def visible_promo(article):
     is_promo = getattr(article, "promoted", None) is not None
     is_author = (c.user_is_loggedin and
                  c.user._id == article.author_id)
-
-    # subreddit discovery links are visible even without a live campaign
-    if article._fullname in g.live_config['sr_discovery_links']:
-        return True
 
     # promos are visible only if comments are not disabled and the
     # user is either the author or the link is live/previously live.
@@ -104,8 +102,6 @@ class Validator(object):
         param_info = {}
         for param in filter(None, tup(self.param)):
             param_info[param] = None
-        if self.docs:
-            param_info.update(self.docs)
         return param_info
 
     def __call__(self, url):
@@ -113,10 +109,14 @@ class Validator(object):
         a = []
         if self.param:
             for p in utils.tup(self.param):
-                if self.post and request.post.get(p):
-                    val = request.post[p]
-                elif self.get and request.get.get(p):
-                    val = request.get[p]
+                # cgi.FieldStorage is falsy even if it has a filled value
+                # property. :(
+                post_val = request.POST.get(p)
+                if self.post and (post_val or
+                                  isinstance(post_val, cgi.FieldStorage)):
+                    val = request.POST[p]
+                elif self.get and request.GET.get(p):
+                    val = request.GET[p]
                 elif self.url and url.get(p):
                     val = url[p]
                 else:
@@ -159,11 +159,16 @@ def _make_validated_kw(fn, simple_vals, param_vals, env):
         kw[var] = validator(env)
     return kw
 
-def set_api_docs(fn, simple_vals, param_vals):
+def set_api_docs(fn, simple_vals, param_vals, extra_vals=None):
     doc = fn._api_doc = getattr(fn, '_api_doc', {})
     param_info = doc.get('parameters', {})
     for validator in chain(simple_vals, param_vals.itervalues()):
-        param_info.update(validator.param_docs())
+        param_docs = validator.param_docs()
+        if validator.docs:
+            param_docs.update(validator.docs)
+        param_info.update(param_docs)
+    if extra_vals:
+        param_info.update(extra_vals)
     doc['parameters'] = param_info
 
 
@@ -195,7 +200,7 @@ def validate(*simple_vals, **param_vals):
     return val
 
 
-def api_validate(response_type=None):
+def api_validate(response_type=None, add_api_type_doc=False):
     """
     Factory for making validators for API calls, since API calls come
     in two flavors: responsive and unresponsive.  The machinary
@@ -237,7 +242,13 @@ def api_validate(response_type=None):
                         responder.send_failure(errors.VERIFIED_USER_REQUIRED)
                         return self.api_wrapper(responder.make_response())
 
-                set_api_docs(newfn, simple_vals, param_vals)
+                extra_param_vals = {}
+                if add_api_type_doc:
+                    extra_param_vals = {
+                        "api_type": "the string `json`",
+                    }
+
+                set_api_docs(newfn, simple_vals, param_vals, extra_param_vals)
                 return newfn
             return val
         return _api_validate
@@ -277,7 +288,8 @@ def _validatedForm(self, self_method, responder, simple_vals, param_vals,
     # add data to the output on some errors
     for validator in simple_vals:
         if (isinstance(validator, VCaptcha) and
-            (form.has_errors('captcha', errors.BAD_CAPTCHA) or c.errors)):
+            (form.has_errors('captcha', errors.BAD_CAPTCHA) or
+             (form.has_error() and c.user.needs_captcha()))):
             form.new_captcha()
         elif (isinstance(validator, VRatelimit) and
               form.has_errors('ratelimit', errors.RATELIMIT)):
@@ -288,13 +300,13 @@ def _validatedForm(self, self_method, responder, simple_vals, param_vals,
     else:
         return self.api_wrapper(responder.make_response())
 
-@api_validate("html")
+@api_validate("html", add_api_type_doc=True)
 def validatedForm(self, self_method, responder, simple_vals, param_vals,
                   *a, **kw):
     return _validatedForm(self, self_method, responder, simple_vals, param_vals,
                           *a, **kw)
 
-@api_validate("html")
+@api_validate("html", add_api_type_doc=True)
 def validatedMultipartForm(self, self_method, responder, simple_vals,
                            param_vals, *a, **kw):
     def wrapped_self_method(*a, **kw):
@@ -352,6 +364,11 @@ class VLang(Validator):
 
     def run(self, lang):
         return VLang.validate_lang(lang)
+
+    def param_docs(self):
+        return {
+            self.param: "a valid IETF language tag (underscore separated)",
+        }
 
 class VRequired(Validator):
     def __init__(self, param, error, *a, **kw):
@@ -466,6 +483,11 @@ class VCount(Validator):
         except ValueError:
             return 0
 
+    def param_docs(self):
+        return {
+            self.param: "a positive integer (default: 0)",
+        }
+
 
 class VLimit(Validator):
     def __init__(self, param, default=25, max_limit=100, **kw):
@@ -475,7 +497,7 @@ class VLimit(Validator):
 
     def run(self, limit):
         default = c.user.pref_numsites
-        if c.render_style in ("compact", api_type("compact")):
+        if not default or c.render_style in ("compact", api_type("compact")):
             default = self.default_limit  # TODO: ini param?
 
         if limit is None:
@@ -501,14 +523,22 @@ class VCssMeasure(Validator):
         return value if value and self.measure.match(value) else ''
 
 subreddit_rx = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_]{2,20}\Z")
+language_subreddit_rx = re.compile(r"\A[a-z]{2}\Z")
 
-def chksrname(x):
+def chksrname(x, allow_language_srs=False):
+    if not x:
+        return None
+
     #notice the space before reddit.com
     if x in ('friends', 'all', ' reddit.com'):
         return False
 
     try:
-        return str(x) if x and subreddit_rx.match(x) else None
+        valid = subreddit_rx.match(x)
+        if allow_language_srs:
+            valid = valid or language_subreddit_rx.match(x)
+
+        return str(x) if valid else None
     except UnicodeEncodeError:
         return None
 
@@ -528,11 +558,32 @@ class VLength(Validator):
     def run(self, text, text2 = ''):
         text = text or text2
         if self.empty_error and (not text or self.only_whitespace.match(text)):
-            self.set_error(self.empty_error)
+            self.set_error(self.empty_error, code=400)
         elif len(text) > self.max_length:
-            self.set_error(self.length_error, {'max_length': self.max_length})
+            self.set_error(self.length_error, {'max_length': self.max_length}, code=400)
         else:
             return text
+
+    def param_docs(self):
+        return {
+            self.param:
+                "a string no longer than %d characters" % self.max_length,
+        }
+
+class VUploadLength(VLength):
+    def run(self, upload, text2=''):
+        # upload is expected to be a FieldStorage object
+        if isinstance(upload, cgi.FieldStorage):
+            return VLength.run(self, upload.value, text2)
+        else:
+            self.set_error(self.empty_error, code=400)
+
+    def param_docs(self):
+        kibibytes = self.max_length / 1024
+        return {
+            self.param:
+                "file upload with maximum size of %d KiB" % kibibytes,
+        }
 
 class VPrintable(VLength):
     def run(self, text, text2 = ''):
@@ -547,9 +598,15 @@ class VPrintable(VLength):
         except UnicodeEncodeError:
             pass
 
-        self.set_error(errors.BAD_STRING)
+        self.set_error(errors.BAD_STRING, code=400)
         return None
 
+    def param_docs(self):
+        return {
+            self.param: "a string up to %d characters long,"
+                        " consisting of printable characters."
+                            % self.max_length,
+        }
 
 class VTitle(VLength):
     def __init__(self, param, max_length = 300, **kw):
@@ -562,7 +619,7 @@ class VTitle(VLength):
         }
 
 class VMarkdown(VLength):
-    def __init__(self, param, max_length = 10000, renderer=None, **kw):
+    def __init__(self, param, max_length = 10000, renderer='reddit', **kw):
         VLength.__init__(self, param, max_length, **kw)
         self.renderer = renderer
 
@@ -600,19 +657,76 @@ class VSelfText(VMarkdown):
     max_length = property(get_max_length, set_max_length)
 
 class VSubredditName(VRequired):
-    def __init__(self, item, *a, **kw):
+    def __init__(self, item, allow_language_srs=False, *a, **kw):
         VRequired.__init__(self, item, errors.BAD_SR_NAME, *a, **kw)
+        self.allow_language_srs = allow_language_srs
 
     def run(self, name):
-        name = chksrname(name)
+        name = chksrname(name, self.allow_language_srs)
         if not name:
-            return self.error()
-        else:
+            self.set_error(self._error, code=400)
+        return name
+
+    def param_docs(self):
+        return {
+            self.param: "subreddit name",
+        }
+
+
+class VAvailableSubredditName(VSubredditName):
+    def run(self, name):
+        name = VSubredditName.run(self, name)
+        if name:
             try:
                 a = Subreddit._by_name(name)
                 return self.error(errors.SUBREDDIT_EXISTS)
             except NotFound:
                 return name
+
+
+class VSRByName(Validator):
+    def run(self, sr_name):
+        if not sr_name:
+            self.set_error(errors.BAD_SR_NAME, code=400)
+        else:
+            try:
+                sr = Subreddit._by_name(sr_name)
+                return sr
+            except NotFound:
+                self.set_error(errors.SUBREDDIT_NOEXIST, code=400)
+
+    def param_docs(self):
+        return {
+            self.param: "subreddit name",
+        }
+
+
+class VSRByNames(Validator):
+    """Returns a dict mapping subreddit names to subreddit objects.
+
+    sr_names_csv - a comma delimited string of subreddit names
+    required - if true (default) an empty subreddit name list is an error
+
+    """
+    def __init__(self, sr_names_csv, required=True):
+        self.required = required
+        Validator.__init__(self, sr_names_csv)
+
+    def run(self, sr_names_csv):
+        if sr_names_csv:
+            sr_names = [s.strip() for s in sr_names_csv.split(',')]
+            return Subreddit._by_name(sr_names)
+        elif self.required:
+            self.set_error(errors.BAD_SR_NAME, code=400)
+            return
+        else:
+            return {}
+
+    def param_docs(self):
+        return {
+            self.param: "comma-delimited list of subreddit names",
+        }
+
 
 class VSubredditTitle(Validator):
     def run(self, title):
@@ -655,7 +769,8 @@ class VByName(Validator):
     # Lookup tdb_sql.Thing or tdb_cassandra.Thing objects by fullname.
     splitter = re.compile('[ ,]+')
     def __init__(self, param, thing_cls=None, multiple=False, limit=None,
-                 error=errors.NO_THING_ID, backend='sql', **kw):
+                 error=errors.NO_THING_ID, ignore_missing=False,
+                 backend='sql', **kw):
         # Limit param only applies when multiple is True
         if not multiple and limit is not None:
             raise TypeError('multiple must be True when limit is set')
@@ -664,6 +779,7 @@ class VByName(Validator):
         self.multiple = multiple
         self.limit = limit
         self._error = error
+        self.ignore_missing = ignore_missing
         self.backend = backend
 
         Validator.__init__(self, param, **kw)
@@ -677,7 +793,11 @@ class VByName(Validator):
                     return self.set_error(errors.TOO_MANY_THING_IDS)
             if items:
                 try:
-                    return tdb_cassandra.Thing._by_fullname(items, return_dict=False)
+                    return tdb_cassandra.Thing._by_fullname(
+                        items,
+                        ignore_missing=self.ignore_missing,
+                        return_dict=False,
+                    )
                 except NotFound:
                     pass
         else:
@@ -688,8 +808,12 @@ class VByName(Validator):
                     return self.set_error(errors.TOO_MANY_THING_IDS)
             if items and (self.multiple or self.re.match(items)):
                 try:
-                    return Thing._by_fullname(items, return_dict=False,
-                                              data=True)
+                    return Thing._by_fullname(
+                        items,
+                        return_dict=False,
+                        ignore_missing=self.ignore_missing,
+                        data=True,
+                    )
                 except NotFound:
                     pass
 
@@ -698,7 +822,7 @@ class VByName(Validator):
     def param_docs(self):
         thingtype = (self.thing_cls or Thing).__name__.lower()
         return {
-            self.param: "fullname of a %s" % thingtype,
+            self.param: "[fullname](#fullnames) of a %s" % thingtype,
         }
 
 class VByNameIfAuthor(VByName):
@@ -712,7 +836,7 @@ class VByNameIfAuthor(VByName):
 
     def param_docs(self):
         return {
-            self.param: "fullname of a thing created by the user",
+            self.param: "[fullname](#fullnames) of a thing created by the user",
         }
 
 class VCaptcha(Validator):
@@ -746,6 +870,9 @@ class VModhash(Validator):
         self.fatal = fatal
 
     def run(self, uh):
+        if uh is None:
+            uh = request.headers.get('X-Modhash')
+
         if not c.user_is_loggedin or uh != c.user.name:
             if self.fatal:
                 abort(403)
@@ -753,12 +880,12 @@ class VModhash(Validator):
 
     def param_docs(self):
         return {
-            self.param: 'a modhash',
+            '%s / X-Modhash header' % self.param: 'a [modhash](#modhashes)',
         }
 
 class VVotehash(Validator):
-    def run(self, vh, thing_name):
-        return True
+    def run(self, vh):
+        return None
 
     def param_docs(self):
         return {
@@ -770,14 +897,19 @@ class VAdmin(Validator):
         if not c.user_is_admin:
             abort(404, "page not found")
 
-class VAdminOrAdminSecret(VAdmin):
-    def run(self, secret):
-        '''If validation succeeds, return True if the secret was used,
-        False otherwise'''
-        if secret and constant_time_compare(secret, g.ADMINSECRET):
-            return True
-        super(VAdminOrAdminSecret, self).run()
-        return False
+def make_or_admin_secret_cls(base_cls):
+    class VOrAdminSecret(base_cls):
+        def run(self, secret=None):
+            '''If validation succeeds, return True if the secret was used,
+            False otherwise'''
+            if secret and constant_time_compare(secret,
+                                                g.secrets["ADMINSECRET"]):
+                return True
+            super(VOrAdminSecret, self).run()
+            return False
+    return VOrAdminSecret
+
+VAdminOrAdminSecret = make_or_admin_secret_cls(VAdmin)
 
 class VVerifiedUser(VUser):
     def run(self):
@@ -803,6 +935,8 @@ class VSponsorAdmin(VVerifiedUser):
         if c.user_is_sponsor:
             return
         abort(403, 'forbidden')
+
+VSponsorAdminOrAdminSecret = make_or_admin_secret_cls(VSponsorAdmin)
 
 class VSponsor(VVerifiedUser):
     """
@@ -844,6 +978,15 @@ class VSponsor(VVerifiedUser):
                 pass
             abort(403, 'forbidden')
 
+
+class VEmployee(VVerifiedUser):
+    """Validate that user is an employee."""
+    def run(self):
+        if not c.user.employee:
+            abort(403, 'forbidden')
+        VVerifiedUser.run(self)
+
+
 class VTrafficViewer(VSponsor):
     def user_test(self, thing):
         return (VSponsor.user_test(self, thing) or
@@ -866,9 +1009,7 @@ class VSrModerator(Validator):
 
 class VCanDistinguish(VByName):
     def run(self, thing_name, how):
-        if c.user_is_admin:
-            return True
-        elif c.user_is_loggedin:
+        if c.user_is_loggedin:
             item = VByName.run(self, thing_name)
             if item.author_id == c.user._id:
                 # will throw a legitimate 500 if this isn't a link or
@@ -879,8 +1020,13 @@ class VCanDistinguish(VByName):
                     return True
                 elif how in ("special", "no") and c.user_special_distinguish:
                     return True
+                elif how in ("admin", "no") and c.user.employee:
+                    return True
 
         abort(403,'forbidden')
+
+    def param_docs(self):
+        return {}
 
 class VSrCanAlter(VByName):
     def run(self, thing_name):
@@ -889,6 +1035,8 @@ class VSrCanAlter(VByName):
         elif c.user_is_loggedin:
             item = VByName.run(self, thing_name)
             if item.author_id == c.user._id:
+                return True
+            elif item.promoted and c.user_is_sponsor:
                 return True
             else:
                 # will throw a legitimate 500 if this isn't a link or
@@ -963,7 +1111,7 @@ class VSubmitParent(VByName):
 
     def param_docs(self):
         return {
-            self.param[0]: "fullname of parent thing",
+            self.param[0]: "[fullname](#fullnames) of parent thing",
         }
 
 class VSubmitSR(Validator):
@@ -1027,6 +1175,11 @@ class VSubscribeSR(VByName):
             return
 
         return sr
+
+    def param_docs(self):
+        return {
+            self.param[0]: "name of a subreddit",
+        }
 
 MIN_PASSWORD_LENGTH = 3
 
@@ -1196,7 +1349,7 @@ class VShamedDomain(Validator):
         if not url:
             return
 
-        is_shamed, domain, reason = is_shamed_domain(url, request.ip)
+        is_shamed, domain, reason = is_shamed_domain(url)
 
         if is_shamed:
             self.set_error(errors.DOMAIN_BANNED, dict(domain=domain,
@@ -1292,6 +1445,17 @@ class VNumber(Validator):
     def cast(self, val):
         raise NotImplementedError
 
+    def _set_error(self):
+        if self.max is None and self.min is None:
+            range = ""
+        elif self.max is None:
+            range = _("%(min)d to any") % dict(min=self.min)
+        elif self.min is None:
+            range = _("any to %(max)d") % dict(max=self.max)
+        else:
+            range = _("%(min)d to %(max)d") % dict(min=self.min, max=self.max)
+        self.set_error(self.error, msg_params=dict(range=range))
+
     def run(self, val):
         if not val:
             return self.num_default
@@ -1309,24 +1473,34 @@ class VNumber(Validator):
                     raise ValueError, ""
             return val
         except ValueError:
-            if self.max is None and self.min is None:
-                range = ""
-            elif self.max is None:
-                range = _("%(min)d to any") % dict(min=self.min)
-            elif self.min is None:
-                range = _("any to %(max)d") % dict(max=self.max)
-            else:
-                range = _("%(min)d to %(max)d") % dict(min=self.min, max=self.max)
-            self.set_error(self.error, msg_params=dict(range=range))
+            self._set_error()
 
 class VInt(VNumber):
     def cast(self, val):
         return int(val)
 
+    def param_docs(self):
+        if self.min is not None and self.max is not None:
+            description = "an integer between %d and %d" % (self.min, self.max)
+        elif self.min is not None:
+            description = "an integer greater than %d" % self.min
+        elif self.max is not None:
+            description = "an integer less than %d" % self.max
+        else:
+            description = "an integer"
+
+        if self.num_default is not None:
+            description += " (default: %d)" % self.num_default
+
+        return {self.param: description}
+
 class VFloat(VNumber):
     def cast(self, val):
         return float(val)
 
+class VBid(VFloat):
+    def _set_error(self):
+        self.set_error(self.error, msg_params=dict(min=self.min, max=self.max))
 
 class VCssName(Validator):
     """
@@ -1343,6 +1517,11 @@ class VCssName(Validator):
             else:
                 self.set_error(errors.BAD_CSS_NAME)
         return ''
+
+    def param_docs(self):
+        return {
+            self.param: "a valid subreddit image name",
+        }
 
 
 class VMenu(Validator):
@@ -1379,7 +1558,8 @@ class VMenu(Validator):
 
     def param_docs(self):
         return {
-            self.param[0]: 'one of (%s)' % ', '.join(self.nav.options),
+            self.param[0]: 'one of (%s)' % ', '.join("`%s`" % s
+                                                  for s in self.nav.options),
         }
 
 
@@ -1424,7 +1604,7 @@ class VRatelimit(Validator):
                 if self.seconds < 3:  # Don't ratelimit within three seconds
                     return
                 self.set_error(errors.RATELIMIT, {'time': time},
-                               field = 'ratelimit')
+                               field='ratelimit', code=429)
             else:
                 self.set_error(self.error)
 
@@ -1537,21 +1717,36 @@ class VOneOf(Validator):
 
     def run(self, val):
         if self.options and val not in self.options:
-            self.set_error(errors.INVALID_OPTION)
+            self.set_error(errors.INVALID_OPTION, code=400)
             return self.default
         else:
             return val
 
     def param_docs(self):
         return {
-            self.param: 'one of (%s)' % ', '.join(self.options)
+            self.param: 'one of (%s)' % ', '.join("`%s`" % s
+                                                  for s in self.options),
         }
+
+
+class VPriority(Validator):
+    def run(self, val):
+        if c.user_is_sponsor:
+            return PROMOTE_PRIORITIES.get(val, PROMOTE_DEFAULT_PRIORITY)
+        else:
+            return PROMOTE_DEFAULT_PRIORITY
+
 
 class VImageType(Validator):
     def run(self, img_type):
         if not img_type in ('png', 'jpg'):
             return 'png'
         return img_type
+
+    def param_docs(self):
+        return {
+            self.param: "one of `png` or `jpg` (default: `png`)",
+        }
 
 
 class ValidEmails(Validator):
@@ -1675,6 +1870,10 @@ class VCnameDomain(Validator):
             except UnicodeEncodeError:
                 self.set_error(errors.BAD_CNAME)
 
+    def param_docs(self):
+        # cnames are dead; don't advertise this.
+        return {}
+
 
 # NOTE: make sure *never* to have res check these are present
 # otherwise, the response could contain reference to these errors...!
@@ -1688,24 +1887,21 @@ class VDate(Validator):
     """
     Date checker that accepts string inputs.
 
-    Optional parameters include 'past' and 'future' which specify how
-    far (in days) into the past or future the date must be to be
-    acceptable.
-
-    NOTE: the 'future' param will have precidence during evaluation.
+    Optional parameters 'earliest' and 'latest' specify the acceptable timedelta
+    offsets (offsets are inclusive).
 
     Error conditions:
        * BAD_DATE on mal-formed date strings (strptime parse failure)
-       * BAD_FUTURE_DATE and BAD_PAST_DATE on respective range errors.
+       * DATE_TOO_EARLY and DATE_TOO_LATE on range errors.
 
     """
-    def __init__(self, param, future=None, past = None,
+    def __init__(self, param, earliest=None, latest=None,
                  sponsor_override = False,
                  reference_date = lambda : datetime.now(g.tz),
                  business_days = False,
                  format = "%m/%d/%Y"):
-        self.future = future
-        self.past   = past
+        self.earliest = earliest
+        self.latest = latest
 
         # are weekends to be exluded from the interval?
         self.business_days = business_days
@@ -1721,26 +1917,24 @@ class VDate(Validator):
 
     def run(self, date):
         now = self.reference_date()
+        earliest = now + self.earliest if self.earliest is not None else None
+        latest = now + self.latest if self.latest is not None else None
         override = c.user_is_sponsor and self.override
         try:
             date = datetime.strptime(date, self.format)
             if not override:
-                # can't put in __init__ since we need the date on the fly
-                future = utils.make_offset_date(now, self.future,
-                                          business_days = self.business_days)
-                past = utils.make_offset_date(now, self.past, future = False,
-                                          business_days = self.business_days)
-                if self.future is not None and date.date() < future.date():
-                    self.set_error(errors.BAD_FUTURE_DATE,
-                               {"day": self.future})
-                elif self.past is not None and date.date() > past.date():
-                    self.set_error(errors.BAD_PAST_DATE,
-                                   {"day": self.past})
+                if earliest and not date.date() >= earliest.date():
+                    self.set_error(errors.DATE_TOO_EARLY,
+                                   {'day': earliest.strftime(self.format)})
+
+                if latest and not date.date() <= latest.date():
+                    self.set_error(errors.DATE_TOO_LATE,
+                                   {'day': latest.strftime(self.format)})
             return date.replace(tzinfo=g.tz)
         except (ValueError, TypeError):
             self.set_error(errors.BAD_DATE)
 
-class VDateRange(VDate):
+class VDateRange(Validator):
     """
     Adds range validation to VDate.  In addition to satisfying
     future/past requirements in VDate, two date fields must be
@@ -1756,12 +1950,14 @@ class VDateRange(VDate):
     def __init__(self, param, max_range=None, required=True, **kw):
         self.max_range = max_range
         self.required = required
-        VDate.__init__(self, param, **kw)
+        self.vstart = VDate(param[0], **kw)
+        self.vend = VDate(param[1], **kw)
+        Validator.__init__(self, param)
 
-
-    def run(self, *a):
+    def run(self, start, end):
         try:
-            start_date, end_date = [VDate.run(self, x) for x in a]
+            start_date = self.vstart.run(start)
+            end_date = self.vend.run(end)
             # If either date is missing and dates are "required",
             # it's a bad range. Additionally, if one date is missing,
             # but the other is provided, it's always an error.
@@ -1786,10 +1982,10 @@ class VDestination(Validator):
 
     def run(self, dest):
         if not dest:
-            dest = request.referer or self.default or "/"
+            dest = self.default or "/"
 
         ld = dest.lower()
-        if ld.startswith(('/', 'http://', 'http://')):
+        if ld.startswith(('/', 'http://', 'https://')):
             u = UrlParser(dest)
 
             if u.is_reddit_url(c.site):
@@ -1813,10 +2009,6 @@ class VDestination(Validator):
         }
 
 class ValidAddress(Validator):
-    def __init__(self, param, allowed_countries = ["United States"]):
-        self.allowed_countries = allowed_countries
-        Validator.__init__(self, param)
-
     def set_error(self, msg, field):
         Validator.set_error(self, errors.BAD_ADDRESS,
                             dict(message=msg), field = field)
@@ -1836,11 +2028,7 @@ class ValidAddress(Validator):
         elif not zipCode:
             self.set_error(_("please provide your zip or post code"), "zip")
         elif not country:
-            self.set_error(_("please pick a country"), "country")
-        else:
-            country_name = g.countries.get(country)
-            if country_name not in self.allowed_countries:
-                self.set_error(_("Our ToS don't cover your country (yet). Sorry."), "country")
+            self.set_error(_("please provide your country"), "country")
 
         # Make sure values don't exceed max length defined in the authorize.net
         # xml schema: https://api.authorize.net/xml/v1/schema/AnetApiSchema.xsd
@@ -1852,6 +2040,7 @@ class ValidAddress(Validator):
             (city, 40, 'city'),
             (state, 40, 'state'),
             (zipCode, 20, 'zip'),
+            (country, 60, 'country'),
             (phoneNumber, 255, 'phoneNumber')
         ]
         for (arg, max_length, form_field_name) in max_lengths:
@@ -1864,7 +2053,7 @@ class ValidAddress(Validator):
                            company = company or "",
                            address = address,
                            city = city, state = state,
-                           zip = zipCode, country = country_name,
+                           zip = zipCode, country = country,
                            phoneNumber = phoneNumber or "")
 
 class ValidCard(Validator):
@@ -1913,6 +2102,10 @@ class VTarget(Validator):
     def run(self, name):
         if name and self.target_re.match(name):
             return name
+
+    def param_docs(self):
+        # this is just for htmllite and of no interest to api consumers
+        return {}
 
 class VFlairAccount(VRequired):
     def __init__(self, item, *a, **kw):
@@ -2119,3 +2312,192 @@ class VPermissions(Validator):
             self.set_error(errors.INVALID_PERMISSIONS, field=self.param[1])
             return (None, None)
         return type, perm_set
+
+
+class VJSON(Validator):
+    def run(self, json_str):
+        if not json_str:
+            return self.set_error('JSON_PARSE_ERROR', code=400)
+        else:
+            try:
+                return json.loads(json_str)
+            except ValueError:
+                return self.set_error('JSON_PARSE_ERROR', code=400)
+
+    def param_docs(self):
+        return {
+            self.param: "JSON data",
+        }
+
+
+class VValidatedJSON(VJSON):
+    """Apply validators to the values of JSON formatted data."""
+    class ArrayOf(object):
+        """A JSON array of objects with the specified schema."""
+        def __init__(self, spec):
+            self.spec = spec
+
+        def run(self, data):
+            if not isinstance(data, list):
+                raise RedditError('JSON_INVALID', code=400)
+
+            validated_data = []
+            for item in data:
+                validated_data.append(self.spec.run(item))
+            return validated_data
+
+        def spec_docs(self):
+            spec_lines = []
+            spec_lines.append('[')
+            for line in self.spec.spec_docs().split('\n'):
+                spec_lines.append('  ' + line)
+            spec_lines[-1] += ','
+            spec_lines.append('  ...')
+            spec_lines.append(']')
+            return '\n'.join(spec_lines)
+
+
+    class Object(object):
+        """A JSON object with validators for specified fields."""
+        def __init__(self, spec):
+            self.spec = spec
+
+        def run(self, data):
+            if not isinstance(data, dict):
+                raise RedditError('JSON_INVALID', code=400)
+
+            validated_data = {}
+            for key, validator in self.spec.iteritems():
+                try:
+                    validated_data[key] = validator.run(data[key])
+                except KeyError:
+                    raise RedditError('JSON_MISSING_KEY', code=400,
+                                      msg_params={'key': key})
+            return validated_data
+
+        def spec_docs(self):
+            spec_docs = {}
+            for key, validator in self.spec.iteritems():
+                if hasattr(validator, 'spec_docs'):
+                    spec_docs[key] = validator.spec_docs()
+                elif hasattr(validator, 'param_docs'):
+                    spec_docs.update(validator.param_docs())
+                    if validator.docs:
+                        spec_docs.update(validator.docs)
+
+            # generate markdown json schema docs
+            spec_lines = []
+            spec_lines.append('{')
+            for key in sorted(spec_docs.keys()):
+                key_docs = spec_docs[key]
+                # indent any new lines
+                key_docs = key_docs.replace('\n', '\n  ')
+                spec_lines.append('  "%s": %s,' % (key, key_docs))
+            spec_lines.append('}')
+            return '\n'.join(spec_lines)
+
+
+    def __init__(self, param, spec, **kw):
+        VJSON.__init__(self, param, **kw)
+        self.spec = spec
+
+    def run(self, json_str):
+        data = VJSON.run(self, json_str)
+        if self.has_errors:
+            return
+
+        # Note: this relies on the fact that all validator errors are dumped
+        # into a global (c.errors) and then checked by @validate.
+        return self.spec.run(data)
+
+    def param_docs(self):
+        spec_md = self.spec.spec_docs()
+
+        # indent for code formatting
+        spec_md = '\n'.join(
+            '    ' + line for line in spec_md.split('\n')
+        )
+
+        return {
+            self.param: 'json data:\n\n' + spec_md,
+        }
+
+
+multi_name_rx = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_]{1,20}\Z")
+multi_name_chars_rx = re.compile(r"[^A-Za-z0-9_]")
+
+class VMultiPath(Validator):
+    @classmethod
+    def normalize(self, path):
+        if path[0] != '/':
+            path = '/' + path
+        path = path.lower().rstrip('/')
+        return path
+
+    def run(self, path):
+        try:
+            require(path)
+            path = self.normalize(path)
+            require(path.startswith('/user/'))
+            user, username, m, name = require_split(path, 5, sep='/')[1:]
+            require(m == 'm')
+            username = chkuser(username)
+            require(username)
+        except RequirementException:
+            self.set_error('BAD_MULTI_PATH', code=400)
+            return
+
+        try:
+            require(multi_name_rx.match(name))
+        except RequirementException:
+            invalid_char = multi_name_chars_rx.search(name)
+            if invalid_char:
+                char = invalid_char.group()
+                if char == ' ':
+                    reason = _('no spaces allowed')
+                else:
+                    reason = _("invalid character: '%s'") % char
+            elif name[0] == '_':
+                reason = _("can't start with a '_'")
+            elif len(name) < 2:
+                reason = _('that name is too short')
+            elif len(name) > 21:
+                reason = _('that name is too long')
+            else:
+                reason = _("that name isn't going to work")
+
+            self.set_error('BAD_MULTI_NAME', {'reason': reason}, code=400)
+            return
+
+        return {'path': path, 'username': username, 'name': name}
+
+    def param_docs(self):
+        return {
+            self.param: "multireddit url path",
+        }
+
+
+class VMultiByPath(Validator):
+    def __init__(self, param, require_view=True, require_edit=False):
+        Validator.__init__(self, param)
+        self.require_view = require_view
+        self.require_edit = require_edit
+
+    def run(self, path):
+        path = VMultiPath.normalize(path)
+        try:
+            multi = LabeledMulti._byID(path)
+        except tdb_cassandra.NotFound:
+            return self.set_error('MULTI_NOT_FOUND', code=404)
+
+        if not multi or (self.require_view and not multi.can_view(c.user)):
+            return self.set_error('MULTI_NOT_FOUND', code=404)
+        if self.require_edit and not multi.can_edit(c.user):
+            return self.set_error('MULTI_CANNOT_EDIT', code=403)
+
+        return multi
+
+    def param_docs(self):
+        return {
+            self.param: "multireddit url path",
+        }

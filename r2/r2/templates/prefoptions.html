@@ -146,6 +146,12 @@
 
       <p>${checkbox(_("show me links I've recently viewed"), "clickgadget")}</p>
       <p>${checkbox(_("compress the link display"), "compress")}</p>
+      <p>${checkbox(_("show additional details in the domain text when available"), "domain_details")}
+        &#32;
+        <span class="little gray">
+          ${_("(such as the source subreddit or the content author's url/name)")}
+        </span>
+      </p>
       <p>${checkbox(_("don't show links after I've liked them"), "hide_ups")}
          &#32;
          <span class="little gray">${_("(except my own)")}</span>
@@ -237,7 +243,7 @@
       ${checkbox(_("show link flair"), "show_link_flair")}
       %if c.user.pref_show_promote is not None:
         <br/>
-        ${checkbox(_("show promote tab on front page"), 
+        ${checkbox(_("show self-serve advertising tab on front page"), 
           "show_promote")}
       %endif
     </td>
@@ -310,12 +316,16 @@
         ${checkbox(_("show sponsorships"), "show_sponsorships")}
         &#32;<span class="little gray">(${_("the 300x100 'sponsored by...' images that sometimes appear in sidebars")})</span>
         <br/>
+        ${checkbox(_("remember what links I've visited"), "store_visits")}
+        &#32;<span class="little gray">(${_("we'll remember and mark what links you've already read, even between computers")})</span>
+        <br/>
         <br/>
         ${checkbox(_("highlight new comments"), "highlight_new_comments")}
         &#32;<span class="little gray">
           (${_("we'll remember your visits for 48 hours and show you which comments you haven't seen yet")})
         </span>
         <br/>
+        ${checkbox(_("notify me when people say my username"), "monitor_mentions")}
     </td>
   </tr>
   %endif

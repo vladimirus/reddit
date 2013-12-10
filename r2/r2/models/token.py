@@ -72,6 +72,8 @@ class Token(tdb_cassandra.Thing):
 
     @classmethod
     def get_token(cls, _id):
+        if _id is None:
+            return None
         try:
             return cls._byID(_id)
         except tdb_cassandra.NotFound:
@@ -102,6 +104,13 @@ class OAuth2Scope:
             "id": "edit",
             "name": _("Edit Posts"),
             "description": _("Edit and delete my comments and submissions."),
+        },
+        "history": {
+            "id": "history",
+            "name": _("History"),
+            "description": _(
+                "Access my voting history and comments or submissions I've"
+                " saved or hidden."),
         },
         "identity": {
             "id": "identity",
@@ -156,6 +165,11 @@ class OAuth2Scope:
             "id": "read",
             "name": _("Read Content"),
             "description": _("Access posts and comments through my account."),
+        },
+        "save": {
+            "id": "save",
+            "name": _("Save Content"),
+            "description": _("Save and unsave comments and submissions."),
         },
         "submit": {
             "id": "submit",

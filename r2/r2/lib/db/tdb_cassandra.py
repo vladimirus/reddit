@@ -34,7 +34,7 @@ from pycassa.cassandra.ttypes import ConsistencyLevel, NotFoundException
 from pycassa.system_manager import (SystemManager, UTF8_TYPE,
                                     COUNTER_COLUMN_TYPE, TIME_UUID_TYPE,
                                     ASCII_TYPE)
-from pycassa.types import DateType
+from pycassa.types import DateType, LongType, IntegerType
 from r2.lib.utils import tup, Storage
 from r2.lib import cache
 from uuid import uuid1, UUID
@@ -116,7 +116,7 @@ def get_manager(seeds):
 class ThingMeta(type):
     def __init__(cls, name, bases, dct):
         type.__init__(cls, name, bases, dct)
-        
+
         if hasattr(cls, '_ttl') and hasattr(cls._ttl, 'total_seconds'):
             cls._ttl = cls._ttl.total_seconds()
 
@@ -412,7 +412,9 @@ class ThingBase(object):
         return '%s_%s' % (self._type_prefix, self._id)
 
     @classmethod
-    def _by_fullname(cls, fnames, return_dict=True):
+    def _by_fullname(cls, fnames, return_dict=True, ignore_missing=False):
+        if ignore_missing:
+            raise NotImplementedError
         ids, is_single = tup(fnames, True)
 
         by_cls = {}
@@ -645,8 +647,14 @@ class ThingBase(object):
         self._deletes.clear()
         self._column_ttls.clear()
 
+    def _destroy(self):
+        self._cf.remove(self._id,
+                        write_consistency_level=self._write_consistency_level)
+
     def __getattr__(self, attr):
-        if attr.startswith('_'):
+        if isinstance(attr, basestring) and attr.startswith('_'):
+            # TODO: I bet this interferes with Views whose column names can
+            # start with a _
             try:
                 return self.__dict__[attr]
             except KeyError:
@@ -669,7 +677,9 @@ class ThingBase(object):
         if attr == '_id' and self._committed:
             raise ValueError('cannot change _id on a committed %r' % (self.__class__))
 
-        if attr.startswith('_'):
+        if isinstance(attr, basestring) and attr.startswith('_'):
+            # TODO: I bet this interferes with Views whose column names can
+            # start with a _
             return object.__setattr__(self, attr, val)
 
         try:
@@ -772,20 +782,24 @@ class ThingBase(object):
                               comm_str, part_str)
 
     if debug:
-        # we only want this with g.debug because overriding __del__
-        # can play hell with memory leaks
+        # we only want this with g.debug because overriding __del__ can play
+        # hell with memory leaks
         def __del__(self):
-                if not self._committed:
-                    # normally we'd log this with g.log or something,
-                    # but we can't guarantee that the thread
-                    # destructing us has access to g
-                    print "Warning: discarding uncomitted %r; this is usually a bug" % (self,)
-                elif self._dirty:
-                    print ("Warning: discarding dirty %r; this is usually a bug (_dirties=%r, _deletes=%r)"
-                           % (self,self._dirties,self._deletes))
+            if not self._committed:
+                # normally we'd log this with g.log or something, but we can't
+                # guarantee that the thread destructing us has access to g
+                print "Warning: discarding uncomitted %r; this is usually a bug" % (self,)
+            elif self._dirty:
+                print ("Warning: discarding dirty %r; this is usually a bug (_dirties=%r, _deletes=%r)"
+                       % (self,self._dirties,self._deletes))
 
 class Thing(ThingBase):
     _timestamp_prop = 'date'
+
+    # alias _date property for consistency with tdb_sql things.
+    @property
+    def _date(self):
+        return self.date
 
 class UuidThing(ThingBase):
     _timestamp_prop = 'date'
@@ -817,19 +831,17 @@ class UuidThing(ThingBase):
 
 
 def view_of(cls):
-    """Register a class as a view of a DenormalizedRelation.
+    """Register a class as a view of a Thing.
 
-    Views are expected to implement two methods:
-
-        create - called on relationship creation. takes a thing1, a list
-                 of thing2s and opaque, extra data passed from above.
-
-        delete - called on relationship destruction. takes a thing1, a list
-                 of things2 and opaque.
+    When a Thing is created or destroyed the appropriate View method must be
+    called to update the View. This can be done using Thing._on_create() for
+    general Thing classes or create()/destroy() for DenormalizedRelation
+    classes.
 
     """
     def view_of_decorator(view_cls):
         cls._views.append(view_cls)
+        view_cls._view_of = cls
         return view_cls
     return view_of_decorator
 
@@ -860,28 +872,28 @@ class DenormalizedRelation(object):
                                        default_validation_class=UTF8_TYPE)
 
     @classmethod
-    def value_for(cls, thing1, thing2, opaque):
+    def value_for(cls, thing1, thing2, **kw):
         """Return a value to store for a relationship between thing1/thing2."""
         raise NotImplementedError()
 
     @classmethod
-    def create(cls, thing1, thing2s, opaque=None):
+    def create(cls, thing1, thing2s, **kw):
         """Create a relationship between thing1 and thing2s.
 
         If there are any other views of this data, they will be updated as
         well.
 
-        Takes an optional parameter "opaque" which can be used by views
+        Takes kwargs which can be used by views
         or value_for to get additional information.
 
         """
         thing2s = tup(thing2s)
-        values = {thing2._id36 : cls.value_for(thing1, thing2, opaque)
+        values = {thing2._id36 : cls.value_for(thing1, thing2, **kw)
                   for thing2 in thing2s}
         cls._cf.insert(thing1._id36, values)
 
         for view in cls._views:
-            view.create(thing1, thing2s, opaque)
+            view.create(thing1, thing2s, **kw)
 
         if cls._write_last_modified:
             from r2.models.last_modified import LastModified
@@ -948,8 +960,8 @@ class ColumnQuery(object):
     """
     _chunk_size = 100
 
-    def __init__(self, cls, rowkeys, column_start="", column_finish="", 
-                 column_count=100, column_reversed=True, 
+    def __init__(self, cls, rowkeys, column_start="", column_finish="",
+                 column_count=100, column_reversed=True,
                  column_to_obj=None,
                  obj_to_column=None):
         self.cls = cls
@@ -978,10 +990,10 @@ class ColumnQuery(object):
     @staticmethod
     def default_column_to_obj(columns):
         """
-        Mapping from column --> object. 
-        
-        This default doesn't actually return the underlying object but we don't 
-        know how to do that without more information. 
+        Mapping from column --> object.
+
+        This default doesn't actually return the underlying object but we don't
+        know how to do that without more information.
         """
         return columns
 
@@ -1074,7 +1086,7 @@ class ColumnQuery(object):
                 yield r
 
     def __repr__(self):
-        return "<%s(%s-%r)>" % (self.__class__.__name__, self.cls.__name__, 
+        return "<%s(%s-%r)>" % (self.__class__.__name__, self.cls.__name__,
                                 self.rowkeys)
 
 class MultiColumnQuery(object):
@@ -1104,7 +1116,7 @@ class MultiColumnQuery(object):
 
         if self.sort_key:
             def sort_key(tup):
-                # Need to point the supplied sort key at the correct item in 
+                # Need to point the supplied sort key at the correct item in
                 # the (sortable, item, generator) tuple
                 return self.sort_key(tup[0])
         else:
@@ -1224,7 +1236,7 @@ class Query(object):
 
 class View(ThingBase):
     # Views are Things like any other, but may have special key
-    # characteristics. Uses ColumnQuery for queries across a row. 
+    # characteristics. Uses ColumnQuery for queries across a row.
 
     _timestamp_prop = None
     _value_type = 'str'
@@ -1243,7 +1255,7 @@ class View(ThingBase):
 
     @classmethod
     def _obj_to_column(cls, objs):
-        """Mapping from _view_of object --> view column. Returns a 
+        """Mapping from _view_of object --> view column. Returns a
         single item dict {column name:column value} or list of dicts."""
         objs, is_single = tup(objs, ret_is_single=True)
 
@@ -1279,7 +1291,7 @@ class View(ThingBase):
 
         column_reversed = not reverse   # Reverse convention for cassandra is opposite
 
-        q = cls._query_cls(cls, rowkeys, column_count=count, 
+        q = cls._query_cls(cls, rowkeys, column_count=count,
                            column_reversed=column_reversed,
                            column_to_obj=cls._column_to_obj,
                            obj_to_column=cls._obj_to_column)
@@ -1327,7 +1339,7 @@ class View(ThingBase):
 
         # can we be smarter here?
         thing_cache.delete(cls._cache_key_id(row_key))
-    
+
     @classmethod
     @will_write
     def _remove(cls, key, columns):

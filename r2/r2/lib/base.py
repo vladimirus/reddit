@@ -26,7 +26,7 @@ from pylons.i18n import N_, _, ungettext, get_lang
 from webob.exc import HTTPException, status_map
 from r2.lib.filters import spaceCompress, _force_unicode
 from r2.lib.template_helpers import get_domain
-from utils import storify, string2js, read_http_date
+from utils import string2js, read_http_date
 
 import re, hashlib
 from urllib import quote
@@ -42,7 +42,7 @@ logging.getLogger('scgi-wsgi').setLevel(logging.CRITICAL)
 
 def is_local_address(ip):
     # TODO: support the /20 and /24 private networks? make this configurable?
-    return ip.startswith('10.')
+    return ip.startswith('10.') or ip == "127.0.0.1"
 
 def abort(code_or_exception=None, detail="", headers=None, comment=None,
           **kwargs):
@@ -76,6 +76,15 @@ class BaseController(WSGIController):
         self.post()
 
     def __call__(self, environ, start_response):
+        # we override this here to ensure that this header, and only this
+        # header, is trusted to reduce the number of potential
+        # misconfigurations between wsgi application servers (e.g. gunicorn
+        # which trusts three different headers out of the box for this) and
+        # haproxy (which won't clean out bad headers by default)
+        forwarded_proto = environ.get("HTTP_X_FORWARDED_PROTO", "http").lower()
+        assert forwarded_proto in ("http", "https")
+        request.environ["wsgi.url_scheme"] = forwarded_proto
+
         true_client_ip = environ.get('HTTP_TRUE_CLIENT_IP')
         ip_hash = environ.get('HTTP_TRUE_CLIENT_IP_HASH')
         forwarded_for = environ.get('HTTP_X_FORWARDED_FOR', ())
@@ -96,11 +105,10 @@ class BaseController(WSGIController):
         if environ.get('HTTP_X_DONT_DECODE'):
             request.charset = None
 
-        request.get = storify(request.GET)
-        request.post = storify(request.POST)
         request.referer = environ.get('HTTP_REFERER')
         request.user_agent = environ.get('HTTP_USER_AGENT')
         request.fullpath = environ.get('FULLPATH', request.path)
+        request.fullurl = request.host_url + request.fullpath
         request.port = environ.get('request_port')
         
         if_modified_since = environ.get('HTTP_IF_MODIFIED_SINCE')
@@ -170,7 +178,7 @@ class BaseController(WSGIController):
 
 
     @classmethod
-    def intermediate_redirect(cls, form_path):
+    def intermediate_redirect(cls, form_path, sr_path=True):
         """
         Generates a /login or /over18 redirect from the current
         fullpath, after having properly reformated the path via
@@ -178,12 +186,12 @@ class BaseController(WSGIController):
         and added as the "dest" parameter of the new url.
         """
         from r2.lib.template_helpers import add_sr
-        params = dict(dest = cls.format_output_url(request.fullpath))
+        params = dict(dest=cls.format_output_url(request.fullurl))
         if c.extension == "widget" and request.GET.get("callback"):
             params['callback'] = request.GET.get("callback")
 
         path = add_sr(cls.format_output_url(form_path) +
-                      query_string(params))
+                      query_string(params), sr_path=sr_path)
         abort(302, location=path)
 
     @classmethod

@@ -108,12 +108,17 @@ def may_revise(sr, user, page=None):
         # the user may not edit.
         return False
     
-    if not sr.can_submit(user):
+    if not sr.wiki_can_submit(user):
         # If the user can not submit to the subreddit
         # They should not be able to contribute
         return False
-    
-    karma = max(user.karma('link', sr), user.karma('comment', sr))
+
+    # Use global karma for the frontpage wiki
+    karma_sr = sr if sr.wiki_use_subreddit_karma else None
+
+    # Use link or comment karma, whichever is greater
+    karma = max(user.karma('link', karma_sr), user.karma('comment', karma_sr))
+
     if karma < (sr.wiki_edit_karma or 0):
         # If the user has too few karma, they should not contribute
         return False
@@ -177,7 +182,7 @@ def normalize_page(page):
 class AbortWikiError(Exception):
     pass
 
-page_match_regex = re.compile(r'^[\w_/]+\Z')
+page_match_regex = re.compile(r'^[\w_\-/]+\Z')
 
 class VWikiModerator(VSrModerator):
     def __init__(self, fatal=False, *a, **kw):

@@ -20,16 +20,25 @@
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from r2.lib.pages.pages import Reddit
+from r2.lib.pages.pages import Reddit, SubredditStylesheetSource
 from pylons import c
 from r2.lib.wrapped import Templated
 from r2.lib.menus import PageNameNav
 from r2.lib.validator.wiki import this_may_revise
+from r2.lib.filters import wikimarkdown, safemarkdown
 from pylons.i18n import _
 
 class WikiView(Templated):
-    def __init__(self, content, edit_by, edit_date, may_revise=False, page=None, diff=None):
+    def __init__(self, content, edit_by, edit_date, may_revise=False,
+                 page=None, diff=None, renderer='wiki'):
         self.page_content_md = content
+        if renderer == 'wiki':
+            self.page_content = wikimarkdown(content)
+        elif renderer == 'reddit':
+            self.page_content = safemarkdown(content)
+        elif renderer == 'stylesheet':
+            self.page_content = SubredditStylesheetSource(content).render()
+        self.renderer = renderer
         self.page = page
         self.diff = diff
         self.edit_by = edit_by
@@ -86,7 +95,7 @@ class WikiPageDiscussions(Templated):
 class WikiBasePage(Reddit):
     extra_page_classes = ['wiki-page']
     
-    def __init__(self, inner_content, page=None, may_revise=False,
+    def __init__(self, content, page=None, may_revise=False,
                  actionless=False, alert=None, description=None, 
                  showtitle=False, **context):
         pageactions = []
@@ -116,20 +125,30 @@ class WikiBasePage(Reddit):
             self.pagetitle = action[1]
         else:
             self.pagetitle = None
-        
-        self.inner_content = inner_content
-        
+
+        page_classes = None
+
+        if page and "title" not in context:
+            context["title"] = _("%(page)s - %(site)s") % {
+                "site": c.site.name,
+                "page": page}
+            page_classes = ['wiki-page-%s' % page.replace('/', '-')]
+
         Reddit.__init__(self, extra_js_config={'wiki_page': page}, 
-                        show_wiki_actions=True, **context)
+                        show_wiki_actions=True, page_classes=page_classes,
+                        content=content, **context)
+
+    def content(self):
+        return self._content
 
 class WikiPageView(WikiBasePage):
-    def __init__(self, content, page, diff=None, **context):
+    def __init__(self, content, page, diff=None, renderer='wiki', **context):
         may_revise = context.get('may_revise')
         if not content and not context.get('alert'):
             if may_revise:
                 context['alert'] = _("this page is empty, edit it to add some content.")
         content = WikiView(content, context.get('edit_by'), context.get('edit_date'), 
-                           may_revise=may_revise, page=page, diff=diff)
+                           may_revise=may_revise, page=page, diff=diff, renderer=renderer)
         WikiBasePage.__init__(self, content, page=page, **context)
 
 class WikiNotFound(WikiBasePage):

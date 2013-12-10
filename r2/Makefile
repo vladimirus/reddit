@@ -45,23 +45,14 @@ endif
 PYX_FILES := $(shell find . -name \*.pyx)
 PYX_C_FILES := $(PYX_FILES:.pyx=.c)
 PYX_SO_FILES := $(PYX_FILES:.pyx=.so)
-PYX_BUILDSTAMP := $(BUILD_DIR)/pyx-buildstamp
 
-.PHONY: clean_pyx
+.PHONY: pyx clean_pyx
 
-pyx: $(PYX_BUILDSTAMP)
-
-$(PYX_C_FILES): %.c: %.pyx
-	cython $<
-
-# this won't rebuild pyx if you're a jerk and delete a .so file without deleting the buildstamp
-# make clean && make pyx will fix this
-$(PYX_BUILDSTAMP): $(PYX_C_FILES)
+pyx:
 	$(PYTHON) setup.py build_ext --inplace
-	touch $@
 
 clean_pyx:
-	rm -f $(PYX_BUILDSTAMP) $(PYX_C_FILES) $(PYX_SO_FILES)
+	rm -f $(PYX_C_FILES) $(PYX_SO_FILES)
 
 #################### i18n
 STRINGS_FILE := r2/lib/strings.py
@@ -71,7 +62,7 @@ GENERATED_STRINGS_FILE := r2/lib/generated_strings.py
 
 # POTFILE is set by Makefile.py
 i18n: $(GENERATED_STRINGS_FILE)
-	$(PYTHON) setup.py extract_messages -o $(POTFILE)
+	$(PYTHON) setup.py extract_messages --input-dirs=r2,$(PLUGIN_I18N_PATHS) -o $(POTFILE)
 
 $(GENERATED_STRINGS_FILE): $(STRINGS_FILE)
 	paster run standalone $(STRINGS_FILE) -c "generate_strings()" > $(GENERATED_STRINGS_FILE)
@@ -95,7 +86,7 @@ clean_ini:
 
 #################### CSS file lists
 SPRITED_STYLESHEETS += reddit.less compact.css
-LESS_STYLESHEETS := goldinfo.less wiki.less adminbar.less
+LESS_STYLESHEETS := wiki.less adminbar.less policies.less
 OTHER_STYLESHEETS := reddit-ie6-hax.css reddit-ie7-hax.css mobile.css highlight.css
 
 #################### Static Files
@@ -135,7 +126,7 @@ endef
 $(foreach plugin,$(PLUGINS),$(eval $(call PLUGIN_STATIC_TEMPLATE,$(plugin))))
 
 #### Stylesheets
-LESSC := r2/lib/contrib/less.js/bin/lessc
+LESSC := lessc
 CSS_COMPRESS := $(PYTHON) r2/lib/contrib/rcssmin.py
 CSS_SOURCE_DIR := $(STATIC_BUILD_DIR)/css
 
@@ -247,17 +238,3 @@ clean_gzip:
 	rm -f $(GZIPPED)
 
 $(shell rm -f $(DEFS_FILE))
-
-#################### country list
-COUNTRY_FILE := $(STATIC_BUILD_DIR)/countries.json
-
-countries: $(COUNTRY_FILE)
-
-$(STATIC_BUILD_DIR):
-	mkdir -p $(STATIC_BUILD_DIR)
-
-$(COUNTRY_FILE): $(STATIC_BUILD_DIR)
-	$(PYTHON) r2/lib/countries.py > $(COUNTRY_FILE)
-
-clean_countries:
-	rm -f $(COUNTRY_FILE)

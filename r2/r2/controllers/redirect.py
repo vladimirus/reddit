@@ -19,6 +19,7 @@
 # All portions of the code written by reddit are Copyright (c) 2006-2013 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
+from pylons import request
 from pylons.controllers.util import abort, redirect_to
 
 from r2.lib.base import BaseController
@@ -29,11 +30,16 @@ class RedirectController(BaseController):
     def GET_redirect(self, dest):
         return redirect_to(str(dest))
 
-    def GET_user_redirect(self, username):
+    def GET_user_redirect(self, username, rest=None):
         user = chkuser(username)
         if not user:
             abort(400)
-        return redirect_to("/user/" + user, _code=301)
+        url = "/user/" + user
+        if rest:
+            url += "/" + rest
+        if request.query_string:
+            url += "?" + request.query_string
+        return redirect_to(str(url), _code=301)
 
     def GET_timereddit_redirect(self, timereddit, rest=None):
         tr_name = chksrname(timereddit)
@@ -44,6 +50,3 @@ class RedirectController(BaseController):
         else:
             rest = ''
         return redirect_to("/r/t:%s/%s" % (tr_name, rest), _code=301)
-
-    def GET_gilded_comments(self):
-        return redirect_to("/r/all/comments/gilded", _code=301)

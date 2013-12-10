@@ -20,12 +20,12 @@
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from pylons import request, g
+from pylons import request, g, c
 from pylons.controllers.util import abort
 
 from r2.controllers.reddit_base import MinimalController
 from r2.lib.pages import MediaEmbedBody
-from r2.lib.scraper import get_media_embed
+from r2.lib.media import get_media_embed
 from r2.lib.validator import validate, VLink
 
 
@@ -37,17 +37,19 @@ class MediaembedController(MinimalController):
             # specifically untrusted domain
             abort(404)
 
-        if not link or not link.media_object:
+        if not c.secure:
+            media_object = link.media_object
+        else:
+            media_object = link.secure_media_object
+
+        if not media_object:
             abort(404)
-
-        if isinstance(link.media_object, basestring):
-            # it's an old-style string
-            content = link.media_object
-
-        elif isinstance(link.media_object, dict):
+        elif isinstance(media_object, dict):
             # otherwise it's the new style, which is a dict(type=type, **args)
-            media_embed = get_media_embed(link.media_object)
+            media_embed = get_media_embed(media_object)
             content = media_embed.content
+
+        c.allow_framing = True
 
         return MediaEmbedBody(body = content).render()
 

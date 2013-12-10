@@ -126,6 +126,7 @@
             margin-right: 0;
             border: 1px solid #8D9CAA;
             list-style: none;
+            max-width: 300px;
         }
         .md.wiki > .toc > ul ul {
             margin: 4px 0;
@@ -151,7 +152,11 @@
         .wiki_button {
             padding: 2px;
         }
-        
+
+        .throbber {
+            margin-bottom: -5px;
+        }
+
         // Submit Discussion button 
         .discussionlink {
             display: inline-block;
@@ -161,6 +166,13 @@
             a {
                 padding-left: 15px;
             }
+        }
+
+        .markhelp {
+            max-width: 500px;
+            font-size: 1.2em;
+            padding: 4px;
+            margin: 5px 0;
         }
 
     }
@@ -203,5 +215,12 @@
             color: white;
             background-color: #5F99CF;
         }
+    }
+    .source {
+        width: 100%;
+        display: none;
+    }
+    .toggle-source {
+        float: right;
     }
 }

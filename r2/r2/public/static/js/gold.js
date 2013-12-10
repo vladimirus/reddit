@@ -4,7 +4,7 @@ r.gold = {
     init: function () {
         $('div.content').on(
             'click',
-            'a.give-gold, .gilded-comment-icon, .gold-payment .close-button',
+            'a.give-gold, .gold-payment .close-button',
             $.proxy(this, '_toggleCommentGoldForm')
         )
 
@@ -12,7 +12,13 @@ r.gold = {
             $("#stripe-payment").show()
         })
 
-        $('.stripe-submit').on('click', this.makeStripeToken)
+        $('#stripe-payment.charge .stripe-submit').on('click', function() {
+            r.gold.tokenThenPost('stripecharge/gold')
+        })
+
+        $('#stripe-payment.modify .stripe-submit').on('click', function() {
+            r.gold.tokenThenPost('modify_subscription')
+        })
     },
 
     _toggleCommentGoldForm: function (e) {
@@ -43,7 +49,6 @@ r.gold = {
 
         var form = $('.gold-form.cloneable:first').clone(),
             authorName = $link.thing().find('.entry .author:first').text(),
-            message = r.strings('gold_summary_comment_gift', {recipient: authorName}),
             passthroughs = form.find('.passthrough'),
             cbBaseUrl = form.find('[name="cbbaseurl"]').val()
 
@@ -115,7 +120,25 @@ r.gold = {
         comment.children('.entry').find('.give-gold').parent().remove()
     },
 
-    makeStripeToken: function () {
+    tokenThenPost: function (dest) {
+        var postOnSuccess = function (status_code, response) {
+            var form = $('#stripe-payment'),
+                submit = form.find('.stripe-submit'),
+                status = form.find('.status'),
+                token = form.find('[name="stripeToken"]')
+
+            if (response.error) {
+                submit.removeAttr('disabled')
+                status.html(response.error.message)
+            } else {
+                token.val(response.id)
+                post_form(form, dest)
+            }
+        }
+        r.gold.makeStripeToken(postOnSuccess)
+    },
+
+    makeStripeToken: function (responseHandler) {
         var form = $('#stripe-payment'),
             publicKey = form.find('[name="stripePublicKey"]').val(),
             submit = form.find('.stripe-submit'),
@@ -132,40 +155,29 @@ r.gold = {
             cardState = form.find('.card-address_state').val(),
             cardCountry = form.find('.card-address_country').val(),
             cardZip = form.find('.card-address_zip').val()
-
-        var stripeResponseHandler = function(status, response) {
-            if (response.error) {
-                submit.removeAttr('disabled')
-                status.html(response.error.message)
-            } else {
-                token.val(response.id)
-                post_form(form, 'stripecharge/gold')
-            }
-        }
-
         Stripe.setPublishableKey(publicKey)
 
         if (!cardName) {
-            status.text(r.strings('missing_credit_name'))
+            status.text(r._('missing name'))
         } else if (!(Stripe.validateCardNumber(cardNumber))) {
-            status.text(r.strings('bad_credit_number'))
+            status.text(r._('invalid credit card number'))
         } else if (!Stripe.validateExpiry(expiryMonth, expiryYear)) {
-            status.text(r.strings('bad_credit_expiry'))
+            status.text(r._('invalid expiration date'))
         } else if (!Stripe.validateCVC(cardCvc)) {
-            status.text(r.strings('bad_credit_cvc'))
+            status.text(r._('invalid cvc'))
         } else if (!cardAddress1) {
-            status.text(r.strings('missing_credit_address'))
+            status.text(r._('missing address'))
         } else if (!cardCity) {
-            status.text(r.strings('missing_credit_city'))
+            status.text(r._('missing city'))
         } else if (!cardState) {
-            status.text(r.strings('missing_credit_state'))
+            status.text(r._('missing state or province'))
         } else if (!cardCountry) {
-            status.text(r.strings('missing_credit_country'))
+            status.text(r._('missing country'))
         } else if (!cardZip) {
-            status.text(r.strings('missing_credit_zip'))
+            status.text(r._('missing zip code'))
         } else {
 
-            status.text('')
+            status.text(reddit.status_msg.submitting)
             submit.attr('disabled', 'disabled')
             Stripe.createToken({
                     name: cardName,
@@ -179,7 +191,7 @@ r.gold = {
                     address_state: cardState,
                     address_country: cardCountry,
                     address_zip: cardZip
-                }, stripeResponseHandler
+                }, responseHandler
             )
         }
         return false

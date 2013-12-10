@@ -26,10 +26,12 @@ from r2.lib.filters import websafe
 from r2.lib.log import log_text
 from r2.models import Account, Message, Report, Subreddit
 from r2.models.award import Award
+from r2.models.gold import append_random_bottlecap_phrase
 from r2.models.token import AwardClaimToken
 
 from _pylibmc import MemcachedError
 from pylons import g
+from pylons.i18n import _
 
 from datetime import datetime, timedelta
 from copy import copy
@@ -226,8 +228,8 @@ def cancel_subscription(subscr_id):
                    (account.name, subscr_id))
 
 def all_gold_users():
-    q = Account._query(Account.c.gold == True, data=True,
-                       sort="_id")
+    q = Account._query(Account.c.gold == True, Account.c._spam == (True, False),
+                       data=True, sort="_id")
     return fetch_things2(q)
 
 def accountid_from_paypalsubscription(subscr_id):
@@ -235,7 +237,7 @@ def accountid_from_paypalsubscription(subscr_id):
         return None
 
     q = Account._query(Account.c.gold_subscr_id == subscr_id,
-                       data=False)
+                       Account.c._spam == (True, False), data=False)
     l = list(q)
     if l:
         return l[0]._id
@@ -247,6 +249,14 @@ def update_gold_users(verbose=False):
     minimum = None
     count = 0
     expiration_dates = {}
+
+    renew_msg = _("[Click here for details on how to set up an "
+                  "automatically-renewing subscription or to renew.]"
+                  "(/gold) If you have any thoughts, complaints, "
+                  "rants, suggestions about reddit gold, please write "
+                  "to us at %(gold_email)s. Your feedback would be "
+                  "much appreciated.\n\nThank you for your past "
+                  "patronage.") % {'gold_email': g.goldthanks_email}
 
     for account in all_gold_users():
         if not hasattr(account, "gold_expiration"):
@@ -262,8 +272,13 @@ def update_gold_users(verbose=False):
             if verbose:
                 print "%s just expired" % account.name
             admintools.degolden(account)
-            send_system_message(account, "Your reddit gold subscription has expired. :(",
-               "Your subscription to reddit gold has expired. [Click here for details on how to renew, or to set up an automatically-renewing subscription.](http://www.reddit.com/gold) Or, if you don't want to, please write to us at 912@reddit.com and tell us where we let you down, so we can work on fixing the problem.")
+            subject = _("Your reddit gold subscription has expired.")
+            message = _("Your subscription to reddit gold has expired.")
+            message += "\n\n" + renew_msg
+            message = append_random_bottlecap_phrase(message)
+
+            send_system_message(account, subject, message,
+                                distinguished='gold-auto')
             continue
 
         count += 1
@@ -280,7 +295,7 @@ def update_gold_users(verbose=False):
         if days_left <= 3 and not g.hardcache.get(hc_key):
             if verbose:
                 print "%s expires soon: %s days" % (account.name, days_left)
-            if getattr(account, "gold_subscr_id", None):
+            if account.has_gold_subscription:
                 if verbose:
                     print "Not sending notice to %s (%s)" % (account.name,
                                                      account.gold_subscr_id)
@@ -288,8 +303,15 @@ def update_gold_users(verbose=False):
                 if verbose:
                     print "Sending notice to %s" % account.name
                 g.hardcache.set(hc_key, True, 86400 * 10)
-                send_system_message(account, "Your reddit gold subscription is about to expire!",
-                                    "Your subscription to reddit gold will be expiring soon. [Click here for details on how to renew, or to set up an automatically-renewing subscription.](http://www.reddit.com/gold) Or, if you don't want to, please write to us at 912@reddit.com and tell us where we let you down, so we can work on fixing the problem.")
+                subject = _("Your reddit gold subscription is about to "
+                            "expire!")
+                message = _("Your subscription to reddit gold will be "
+                            "expiring soon.")
+                message += "\n\n" + renew_msg
+                message = append_random_bottlecap_phrase(message)
+
+                send_system_message(account, subject, message,
+                                    distinguished='gold-auto')
 
     if verbose:
         for exp_date in sorted(expiration_dates.keys()):
@@ -308,11 +330,14 @@ def admin_ratelimit(user):
 def is_banned_IP(ip):
     return False
 
-def is_banned_domain(dom, ip):
+def is_banned_domain(dom):
     return None
 
-def is_shamed_domain(dom, ip):
+def is_shamed_domain(dom):
     return False, None, None
+
+def bans_for_domain_parts(dom):
+    return []
 
 def valid_thing(v, karma, *a, **kw):
     return not v._thing1._spam
@@ -396,18 +421,21 @@ def filter_quotas(unfiltered):
         return baskets, None
 
 
-def send_system_message(user, subject, body):
+def send_system_message(user, subject, body, system_user=None,
+                        distinguished='admin', repliable=False):
     from r2.lib.db import queries
 
-    system_user = Account.system_user()
+    if system_user is None:
+        system_user = Account.system_user()
     if not system_user:
-        g.log.warning("g.system_user isn't set properly. Can't send system message.")
+        g.log.warning("Can't send system message "
+                      "- invalid system_user or g.system_user setting")
         return
 
     item, inbox_rel = Message._new(system_user, user, subject, body,
                                    ip='0.0.0.0')
-    item.distinguished = 'admin'
-    item.repliable = False
+    item.distinguished = distinguished
+    item.repliable = repliable
     item._commit()
 
     try:

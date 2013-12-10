@@ -22,10 +22,9 @@
 
 <%!
    from r2.lib.template_helpers import get_domain
-   from r2.lib.template_helpers import s3_https_if_secure
+   from r2.lib.template_helpers import media_https_if_secure
    from r2.lib.pages.things import LinkButtons
    from r2.lib.pages import WrappedUser
-   from r2.lib.template_helpers import static
    from r2.lib.strings import Score, strings
 %>
  
@@ -35,14 +34,19 @@
  
 <%def name="numcol()">
   <% num = thing.num %>
-  <span class="rank" style="width:${thing.numcolmargin};">
-    ${thing.num}
+  <span class="rank">
+    %if thing.num > 0:
+      ${thing.num}
+    %endif
   </span>
 </%def>
 
-<%def name="make_link(name, css_class)">
-  <a class="${css_class} ${ c.user_is_loggedin and 'loggedin' or ''} ${thing.clicked and 'click' or ''}"
+<%def name="make_link(name, css_class, tabindex=0)">
+  <a class="${css_class} ${ c.user_is_loggedin and 'loggedin' or ''}"
      href="${thing.href_url}"
+     %if tabindex:
+       tabindex="${tabindex}"
+     %endif
      %if thing.nofollow:
        rel="nofollow"
      %endif
@@ -87,19 +91,13 @@
     %if c.site.link_flair_position == 'left':
       <%call expr="flair()" />
     %endif
-    <%call expr="make_link('title', 'title')">
+    <%call expr="make_link('title', 'title', tabindex=1)">
       ${thing.title}
     </%call>
     %if c.site.link_flair_position == 'right':
       <%call expr="flair()" />
     %endif
-    %if getattr(thing, "approval_checkmark", None):
-        <img class="approval-checkmark" title="${thing.approval_checkmark}"
-             src="${static('green-check.png')}"
-             onclick="alert('${thing.approval_checkmark}\n\n' +
-'${_("(no need to click for this info; just hover over the checkmark next time)")}')"
-           />
-    %endif
+    ${self.approval_checkmark()}
     &#32;
 
     ${self.domain()}
@@ -162,7 +160,7 @@
 </%def>
 
 <%def name="thing_css_class(what)" buffered="True">
-${parent.thing_css_class(what)} ${"over18" if thing.over_18 else ""}
+${parent.thing_css_class(what)} ${"over18" if thing.over_18 else ""} ${thing.visited and 'visited' or ''}
 %if c.user.pref_show_link_flair and (thing.flair_text or thing.flair_css_class):
   <% css = thing.flair_css_class or '' %>
   linkflair ${' '.join('linkflair-' + c for c in css.split())}
@@ -177,17 +175,10 @@ ${parent.thing_data_attributes(what)} data-ups="${what.upvotes}" data-downs="${w
   ${plain_link(thing.subreddit.name, thing.subreddit_path, sr_path = False,
                cname = False, _class = "subreddit hover",
                target='_blank' if thing.newwindow else '')}
-  <script type="text/javascript">
-    reddit.sr['${thing._fullname}'] = '${thing.subreddit._fullname}';
-  </script>
 </%def>
 
 <%def name="midcol(display=True, cls = '')">
-  %if thing.pref_compress:
     <div class="midcol ${cls}"
-  %else:
-    <div class="midcol ${cls}" style="width:${thing.midcolmargin};" 
-  %endif
        ${not display and "style='display:none'" or ''}>
     ${self.arrow(thing, 1, thing.likes)}
     %if thing.pref_compress:
@@ -207,7 +198,7 @@ ${parent.thing_data_attributes(what)} data-ups="${what.upvotes}" data-downs="${w
 
 <%def name="domain()">
   <span class="domain">
-    (${plain_link(thing.domain, thing.domain_path, _sr_path = False)})
+    (<a href="${thing.domain_path}">${thing.domain_str}</a>)
     %if c.user_is_admin:
       &#32;
       <a class="adminbox" href="/admin/domain/${thing.domain}">d</a>
@@ -225,6 +216,9 @@ ${parent.thing_data_attributes(what)} data-ups="${what.upvotes}" data-downs="${w
                               author=WrappedUser(thing.author, thing.attribs, thing).render(),
                               lastedited=capture(edited, thing, thing.lastedited)
                               ))}
+  %if thing.stickied:
+    &#32;-&#32;<span class="stickied-tagline" title="selected by this subreddit's moderators">stickied post</span>
+  %endif
 </%def>
 
 <%def name="child()">
@@ -246,7 +240,7 @@ ${parent.thing_data_attributes(what)} data-ups="${what.upvotes}" data-downs="${w
             else:
                 size_str = ""
         %>
-        <img src="${s3_https_if_secure(thing.thumbnail)}" ${size_str} alt=""/>
+        <img src="${media_https_if_secure(thing.thumbnail)}" ${size_str} alt=""/>
     % endif
   </%call>
   %endif

@@ -22,11 +22,15 @@
 
 from datetime import datetime
 from urlparse import urlparse
+
+import base64
 import ConfigParser
+import locale
 import json
 import logging
 import os
 import signal
+import site
 import socket
 import subprocess
 import sys
@@ -34,6 +38,7 @@ import sys
 from sqlalchemy import engine, event
 
 import cssutils
+import pkg_resources
 import pytz
 
 from r2.config import queues
@@ -53,16 +58,17 @@ from r2.lib.cache import (
 )
 from r2.lib.configparse import ConfigValue, ConfigValueParser
 from r2.lib.contrib import ipaddress
-from r2.lib.countries import get_countries_and_codes
 from r2.lib.lock import make_lock_factory
 from r2.lib.manager import db_manager
 from r2.lib.plugin import PluginLoader
+from r2.lib.providers import select_provider
 from r2.lib.stats import Stats, CacheStats, StatsCollectingConnectionPool
 from r2.lib.translation import get_active_langs, I18N_PATH
 from r2.lib.utils import config_gold_price, thread_dump
-from r2.lib.zookeeper import LiveDict
+
 
 LIVE_CONFIG_NODE = "/config/live"
+SECRETS_NODE = "/config/secrets"
 
 
 def extract_live_config(config, plugins):
@@ -80,6 +86,24 @@ def extract_live_config(config, plugins):
         parsed.add_spec(plugin.live_config)
 
     return parsed
+
+
+def _decode_secrets(secrets):
+    return {key: base64.b64decode(value) for key, value in secrets.iteritems()}
+
+
+def extract_secrets(config):
+    # similarly to the live_config one above, if we just did
+    # .options("secrets") we'd get back all the junk from DEFAULT too. bleh.
+    secrets = config._sections["secrets"].copy()
+    del secrets["__name__"]  # magic value used by ConfigParser
+    return _decode_secrets(secrets)
+
+
+def fetch_secrets(zk_client):
+    node_data = zk_client.get(SECRETS_NODE)[0]
+    secrets = json.loads(node_data)
+    return _decode_secrets(secrets)
 
 
 class Globals(object):
@@ -123,10 +147,13 @@ class Globals(object):
             'sr_moderator_invite_quota',
             'sr_contributor_quota',
             'sr_quota_time',
+            'sr_invite_limit',
             'wiki_keep_recent_days',
             'wiki_max_page_length_bytes',
             'wiki_max_page_name_length',
             'wiki_max_page_separators',
+            'min_promote_future',
+            'max_promote_future',
         ],
 
         ConfigValue.float: [
@@ -151,7 +178,6 @@ class Globals(object):
             'read_only_mode',
             'disable_wiki',
             'heavy_load_mode',
-            's3_media_direct',
             'disable_captcha',
             'disable_ads',
             'disable_require_admin_otp',
@@ -159,6 +185,8 @@ class Globals(object):
             'static_secure_pre_gzipped',
             'trust_local_proxies',
             'shard_link_vote_queues',
+            'shard_commentstree_queues',
+            'subreddit_stylesheets_static',
         ],
 
         ConfigValue.tuple: [
@@ -169,21 +197,32 @@ class Globals(object):
             'permacache_memcaches',
             'rendercaches',
             'pagecaches',
+            'memoizecaches',
             'cassandra_seeds',
             'admins',
             'sponsors',
+            'employees',
             'automatic_reddits',
-            'agents',
             'allowed_css_linked_domains',
             'authorized_cnames',
             'hardcache_categories',
-            's3_media_buckets',
-            'allowed_pay_countries',
             'case_sensitive_domains',
             'reserved_subdomains',
             'TRAFFIC_LOG_HOSTS',
             'exempt_login_user_agents',
             'timed_templates',
+        ],
+
+        ConfigValue.dict(ConfigValue.str, ConfigValue.int): [
+            'agents',
+        ],
+
+        ConfigValue.str: [
+            'wiki_page_registration_info',
+            'wiki_page_privacy_policy',
+            'wiki_page_user_agreement',
+            'wiki_page_gold_bottlecaps',
+            'adserver_click_domain',
         ],
 
         ConfigValue.choice: {
@@ -200,28 +239,39 @@ class Globals(object):
         config_gold_price: [
             'gold_month_price',
             'gold_year_price',
+            'cpm_selfserve',
         ],
     }
 
     live_config_spec = {
         ConfigValue.bool: [
             'frontpage_dart',
+            'frontend_logging',
         ],
         ConfigValue.float: [
             'spotlight_interest_sub_p',
             'spotlight_interest_nosub_p',
+            'gold_revenue_goal',
         ],
         ConfigValue.tuple: [
-            'sr_discovery_links',
             'fastlane_links',
+            'listing_chooser_sample_multis',
+            'discovery_srs',
+        ],
+        ConfigValue.str: [
+            'listing_chooser_gold_multi',
+            'listing_chooser_explore_sr',
         ],
         ConfigValue.dict(ConfigValue.int, ConfigValue.float): [
             'comment_tree_version_weights',
         ],
         ConfigValue.messages: [
-            'goldvertisement_blurbs',
-            'goldvertisement_has_gold_blurbs',
             'welcomebar_messages',
+            'sidebar_message',
+            'gold_sidebar_message',
+        ],
+        ConfigValue.dict(ConfigValue.str, ConfigValue.float): [
+            'pennies_per_server_second',
         ],
     }
 
@@ -253,9 +303,18 @@ class Globals(object):
 
         global_conf.setdefault("debug", False)
 
+        # reloading site ensures that we have a fresh sys.path to build our
+        # working set off of. this means that forked worker processes won't get
+        # the sys.path that was current when the master process was spawned
+        # meaning that new plugins will be picked up on regular app reload
+        # rather than having to restart the master process as well.
+        reload(site)
+        self.pkg_resources_working_set = pkg_resources.WorkingSet()
+
         self.config = ConfigValueParser(global_conf)
         self.config.add_spec(self.spec)
-        self.plugins = PluginLoader(self.config.get("plugins", []))
+        self.plugins = PluginLoader(self.pkg_resources_working_set,
+                                    self.config.get("plugins", []))
 
         self.stats = Stats(self.config.get('statsd_addr'),
                            self.config.get('statsd_sample_rate'))
@@ -293,6 +352,15 @@ class Globals(object):
     def setup(self):
         self.queues = queues.declare_queues(self)
 
+        ################# PROVIDERS
+        self.media_provider = select_provider(
+            self.config,
+            self.pkg_resources_working_set,
+            "r2.provider.media",
+            self.media_provider,
+        )
+        self.startup_timer.intermediate("providers")
+
         ################# CONFIGURATION
         # AMQP is required
         if not self.amqp_host:
@@ -307,16 +375,12 @@ class Globals(object):
 
         origin_prefix = self.domain_prefix + "." if self.domain_prefix else ""
         self.origin = "http://" + origin_prefix + self.domain
-        self.secure_domains = set([urlparse(self.payment_domain).netloc])
 
         self.trusted_domains = set([self.domain])
         self.trusted_domains.update(self.authorized_cnames)
         if self.https_endpoint:
             https_url = urlparse(self.https_endpoint)
-            self.secure_domains.add(https_url.netloc)
             self.trusted_domains.add(https_url.hostname)
-        if getattr(self, 'oauth_domain', None):
-            self.secure_domains.add(self.oauth_domain)
 
         # load the unique hashed names of files under static
         static_files = os.path.join(self.paths.get('static_files'), 'static')
@@ -356,16 +420,6 @@ class Globals(object):
         csslog = logging.getLogger("cssutils")
         cssutils.log.setLog(csslog)
 
-        # load the country list
-        countries_file_path = os.path.join(static_files, "countries.json")
-        try:
-            with open(countries_file_path) as handle:
-                self.countries = json.load(handle)
-            self.log.debug("Using countries.json.")
-        except IOError:
-            self.log.warning("Couldn't find countries.json. Using pycountry.")
-            self.countries = get_countries_and_codes()
-
         if not self.media_domain:
             self.media_domain = self.domain
         if self.media_domain == self.domain:
@@ -386,6 +440,8 @@ class Globals(object):
             # not all platforms have user signals
             signal.signal(signal.SIGUSR1, thread_dump)
 
+        locale.setlocale(locale.LC_ALL, self.locale)
+
         self.startup_timer.intermediate("configuration")
 
         ################# ZOOKEEPER
@@ -401,26 +457,37 @@ class Globals(object):
             self.zookeeper = connect_to_zookeeper(zk_hosts, (zk_username,
                                                              zk_password))
             self.live_config = LiveConfig(self.zookeeper, LIVE_CONFIG_NODE)
+            self.secrets = fetch_secrets(self.zookeeper)
             self.throttles = LiveList(self.zookeeper, "/throttles",
                                       map_fn=ipaddress.ip_network,
                                       reduce_fn=ipaddress.collapse_addresses)
-            self.banned_domains = LiveDict(self.zookeeper, 
-                                           "/banned-domains",
-                                           watch=True)
         else:
             self.zookeeper = None
             parser = ConfigParser.RawConfigParser()
+            parser.optionxform = str
             parser.read([self.config["__file__"]])
             self.live_config = extract_live_config(parser, self.plugins)
+            self.secrets = extract_secrets(parser)
             self.throttles = tuple()  # immutable since it's not real
-            self.banned_domains = dict()
+
         self.startup_timer.intermediate("zookeeper")
 
         ################# MEMCACHE
         num_mc_clients = self.num_mc_clients
 
         # the main memcache pool. used for most everything.
-        self.memcache = CMemcache(self.memcaches, num_clients=num_mc_clients)
+        self.memcache = CMemcache(
+            self.memcaches,
+            min_compress_len=50 * 1024,
+            num_clients=num_mc_clients,
+        )
+
+        # a pool just used for @memoize results
+        memoizecaches = CMemcache(
+            self.memoizecaches,
+            min_compress_len=50 * 1024,
+            num_clients=num_mc_clients,
+        )
 
         # a smaller pool of caches used only for distributed locks.
         # TODO: move this to ZooKeeper
@@ -433,6 +500,7 @@ class Globals(object):
         # a row cache.
         if self.permacache_memcaches:
             permacache_memcaches = CMemcache(self.permacache_memcaches,
+                                             min_compress_len=50 * 1024,
                                              num_clients=num_mc_clients)
         else:
             permacache_memcaches = None
@@ -451,6 +519,7 @@ class Globals(object):
             noreply=True,
             no_block=True,
             num_clients=num_mc_clients,
+            min_compress_len=1400,
         )
 
         # pagecaches hold fully rendered pages
@@ -459,6 +528,7 @@ class Globals(object):
             noreply=True,
             no_block=True,
             num_clients=num_mc_clients,
+            min_compress_len=1400,
         )
 
         self.startup_timer.intermediate("memcache")
@@ -514,6 +584,17 @@ class Globals(object):
         else:
             self.cache = MemcacheChain((localcache_cls(), self.memcache))
         cache_chains.update(cache=self.cache)
+
+        if stalecaches:
+            self.memoizecache = StaleCacheChain(
+                localcache_cls(),
+                stalecaches,
+                memoizecaches,
+            )
+        else:
+            self.memoizecache = MemcacheChain(
+                (localcache_cls(), memoizecaches))
+        cache_chains.update(memoizecache=self.memoizecache)
 
         self.rendercache = MemcacheChain((
             localcache_cls(),

@@ -3,10 +3,10 @@ r.ui.init = function() {
     if ($.cookie('reddit_first')) {
         // save welcome seen state and delete obsolete cookie
         $.cookie('reddit_first', null, {domain: r.config.cur_domain})
-        store.set('ui.shown.welcome', true)
-    } else if (store.get('ui.shown.welcome') != true) {
+        store.safeSet('ui.shown.welcome', true)
+    } else if (store.safeGet('ui.shown.welcome') != true) {
         $('.infobar.welcome').show()
-        store.set('ui.shown.welcome', true)
+        store.safeSet('ui.shown.welcome', true)
     }
 
     // mobile suggest infobar
@@ -17,7 +17,7 @@ r.ui.init = function() {
     if (smallScreen && onFrontPage && r.config.renderstyle != 'compact') {
         var infobar = $('<div class="infobar mellow">')
             .html(r.utils.formatMarkdownLinks(
-                r.strings('compact_suggest', {
+                r._("Looks like you're browsing on a small screen. Would you like to try [reddit's mobile interface](%(url)s)?").format({
                     url: location + '.compact'
                 })
             ))
@@ -28,7 +28,57 @@ r.ui.init = function() {
         $(el).data('HelpBubble', new r.ui.Bubble({el: el}))
     })
 
+    $('.submit_text').each(function(idx, el) {
+        $(el).data('SubredditSubmitText', new r.ui.SubredditSubmitText({el: el}))
+    })
+
     r.ui.PermissionEditor.init()
+}
+
+r.ui.showWorkingDeferred = function(el, deferred) {
+    if (!deferred) {
+        return
+    }
+
+    var flickerDelay = 200,
+        key = '_workingCount',
+        $el = $(el)
+
+    // keep a count of active calls on this element so we can track multiple
+    // deferreds at the same time.
+    $el.data(key, ($el.data(key) || 0) + 1)
+
+    // prevent flicker
+    var flickerTimeout = setTimeout(function() {
+        $el.addClass('working')
+    }, flickerDelay)
+
+    deferred.always(function() {
+        clearTimeout(flickerTimeout)
+        var count = Math.max(0, $el.data(key) - 1)
+        $el.data(key, count)
+        if (count == 0) {
+            $el.removeClass('working')
+        }
+    })
+
+    return deferred
+}
+
+r.ui.refreshListing = function() {
+    var url = $.url(),
+        params = url.param()
+    params['bare'] = 'y'
+    return $.ajax({
+        type: 'GET',
+        url: url.attr('base') + url.attr('path'),
+        data: params
+    }).done(function(resp) {
+        $('body > .content')
+            .html(resp)
+            .find('.promotedlink.promoted:visible')
+                .trigger('onshow')
+    })
 }
 
 r.ui.Form = function(el) {
@@ -39,26 +89,6 @@ r.ui.Form = function(el) {
     }, this))
 }
 r.ui.Form.prototype = $.extend(new r.ui.Base(), {
-    workingDelay: 200,
-
-    setWorking: function(isWorking) {
-        // Delay the initial throbber display to prevent flashes for fast
-        // operations
-        if (isWorking) {
-            if (!this.$el.hasClass('working') && !this._workingTimer) {
-                this._workingTimer = setTimeout($.proxy(function() {
-                    this.$el.addClass('working')
-                }, this), this.workingDelay)
-            }
-        } else {
-            if (this._workingTimer) {
-                clearTimeout(this._workingTimer)
-                delete this._workingTimer
-            }
-            this.$el.removeClass('working')
-        }
-    },
-
     showStatus: function(msg, isError) {
         this.$el.find('.status')
             .show()
@@ -108,29 +138,26 @@ r.ui.Form.prototype = $.extend(new r.ui.Base(), {
 
     submit: function() {
         this.resetErrors()
-        this.setWorking(true)
-        this._submit()
+        r.ui.showWorkingDeferred(this.$el, this._submit())
+            .done($.proxy(this, 'handleResult'))
+            .fail($.proxy(this, '_handleNetError'))
     },
 
     _submit: function() {},
 
-    handleResult: function(result, err, xhr) {
-        if (result) {
-            this.checkCaptcha(result.json.errors)
-            this._handleResult(result)
-        } else {
-            this.setWorking(false)
-            this._handleNetError(result, err, xhr)
-        }
+    handleResult: function(result) {
+        this.checkCaptcha(result.json.errors)
+        this._handleResult(result)
     },
 
     _handleResult: function(result) {
         this.showErrors(result.json.errors)
-        this.setWorking(false)
     },
 
-    _handleNetError: function(result, err, xhr) {
-        this.showStatus(r.strings('an_error_occurred', {status: xhr.status}), true)
+    _handleNetError: function(xhr) {
+        var message = r._('an error occurred (status: %(status)s)')
+                         .format({status: xhr.status})
+        this.showStatus(message, true)
     }
 })
 
@@ -140,21 +167,29 @@ r.ui.Bubble = Backbone.View.extend({
     animateDuration: 150,
 
     initialize: function() {
-        this.$el.hover($.proxy(this, 'queueShow'), $.proxy(this, 'queueHide'))
         this.$parent = this.options.parent || this.$el.parent()
-        this.$parent.hover($.proxy(this, 'queueShow'), $.proxy(this, 'queueHide'))
-        this.$parent.click($.proxy(this, 'queueShow'))
+        if (this.options.trackHover != false) {
+            this.$el.hover($.proxy(this, 'queueShow'), $.proxy(this, 'queueHide'))
+            this.$parent.hover($.proxy(this, 'queueShow'), $.proxy(this, 'queueHide'))
+            this.$parent.click($.proxy(this, 'queueShow'))
+        }
     },
 
     position: function() {
         var parentPos = this.$parent.offset(),
             bodyOffset = $('body').offset(),
             offsetX, offsetY
-        if (this.$el.is('.anchor-top')) {
+        if (this.$el.is('.anchor-top') || this.$el.is('.anchor-top-centered')) {
             offsetX = this.$parent.outerWidth(true) - this.$el.outerWidth(true)
             offsetY = this.$parent.outerHeight(true) + 5
             this.$el.css({
-                left: parentPos.left + offsetX,
+                left: Math.max(parentPos.left + offsetX, 0),
+                top: parentPos.top + offsetY - bodyOffset.top
+            })
+        } else if (this.$el.is('.anchor-top-left')) {
+            offsetY = this.$parent.outerHeight(true) + 5
+            this.$el.css({
+                left: parentPos.left,
                 top: parentPos.top + offsetY - bodyOffset.top
             })
         } else if (this.$el.is('.anchor-right')) {
@@ -175,6 +210,13 @@ r.ui.Bubble = Backbone.View.extend({
             this.$el.css({
                 top: r.utils.clamp(parentPos.top - offsetY, 0, $(window).height() - this.$el.outerHeight()),
                 left: r.utils.clamp(parentPos.left - offsetX - this.$el.width(), 0, $(window).width())
+            })
+        } else if (this.$el.is('.anchor-left')) {
+            offsetX = this.$parent.outerWidth(true) + 16
+            offsetY = 0
+            this.$el.css({
+                left: parentPos.left + offsetX,
+                top: parentPos.top + offsetY - bodyOffset.top
             })
         }
     },
@@ -211,11 +253,10 @@ r.ui.Bubble = Backbone.View.extend({
 
     hideNow: function() {
         this.cancelTimeout()
-        if (this.options.group) {
+        if (this.options.group && this.options.group.current == this) {
             this.options.group.current = null
         }
         this.$el.hide()
-        this.$parent.append(this.$el)
     },
 
     hide: function(callback) {
@@ -237,7 +278,7 @@ r.ui.Bubble = Backbone.View.extend({
         }
 
         var animProp, animOffset
-        if (this.$el.is('.anchor-top')) {
+        if (this.$el.is('.anchor-top') || this.$el.is('.anchor-top-centered') || this.$el.is('.anchor-top-left')) {
             animProp = 'top'
             animOffset = '-=5'
         } else if (this.$el.is('.anchor-right')) {
@@ -246,6 +287,9 @@ r.ui.Bubble = Backbone.View.extend({
         } else if (this.$el.is('.anchor-right-fixed')) {
             animProp = 'right'
             animOffset = '-=5'
+        } else if (this.$el.is('.anchor-left')) {
+            animProp = 'left'
+            animOffset = '+=5'
         }
         var curOffset = this.$el.css(animProp)
 
@@ -295,7 +339,7 @@ r.ui.PermissionEditor = function(el) {
     var permission_type = params.type
     var name = params.name
     this.form_id = permission_type + "-permissions-" + name
-    this.permission_info = r.strings.permissions.info[permission_type]
+    this.permission_info = r.permissions[permission_type]
     this.sorted_perm_keys = $.map(this.permission_info,
                                   function(v, k) { return k })
     this.sorted_perm_keys.sort()
@@ -318,7 +362,7 @@ r.ui.PermissionEditor.init = function() {
         })
     }
     activate('body')
-    for (var permission_type in r.strings.permissions.info) {
+    for (var permission_type in r.permissions) {
         $('.' + permission_type + '-table')
             .on('insert-row', 'tr', function(e) { activate(this) })
     }
@@ -373,11 +417,11 @@ r.ui.PermissionEditor.prototype = $.extend(new r.ui.Base(), {
                 update()
             })
             $label.append(
-                document.createTextNode(r.strings.permissions.all_msg))
+                document.createTextNode(r._('full permissions')))
         } else if (info) {
             $input.change(update)
-            $label.append(document.createTextNode(info.title))
-            $label.attr("title", info.description)
+            $label.append(document.createTextNode(r._(info.title)))
+            $label.attr("title", r._(info.description))
         }
         return $label
     },
@@ -423,15 +467,15 @@ r.ui.PermissionEditor.prototype = $.extend(new r.ui.Base(), {
         var info = this.permission_info[perm]
         var text
         if (perm == "all") {
-            text = r.strings.permissions.all_msg
+            text = r._("full permissions")
         } else if (info) {
-            text = info.title
+            text = r._(info.title)
         } else {
             text = perm
         }
         var $span = $('<span class="permission-bit"/>').text(text)
         if (info) {
-            $span.attr("title", info.description)
+            $span.attr("title", r._(info.description))
         }
         return $span
     },
@@ -472,7 +516,7 @@ r.ui.PermissionEditor.prototype = $.extend(new r.ui.Base(), {
         }
         if (!spans.length) {
             spans.push($('<span class="permission-bit">')
-                .text(r.strings.permissions.none_msg)
+                .text(r._('no permissions'))
                 .addClass("none"))
         }
         var $new_summary = $('<div class="permission-summary">')
@@ -494,5 +538,144 @@ r.ui.PermissionEditor.prototype = $.extend(new r.ui.Base(), {
         this.$el.find('input[name="permissions"]').val(perms)
         this.original_perms = this._parsePerms(perms)
         this.hide()
+    }
+})
+
+r.ui.scrollFixed = function(el) {
+    this.$el = $(el)
+    this.$standin = null
+    this.onScroll()
+    $(window).bind('scroll resize', _.bind(_.throttle(this.onScroll, 20), this))
+}
+r.ui.scrollFixed.prototype = {
+    onScroll: function() {
+        if (!this.$el.is('.scroll-fixed')) {
+            var margin = this.$el.outerHeight(true) - this.$el.outerHeight(false)
+            this.origTop = this.$el.offset().top - margin
+        }
+
+        var enoughSpace = this.$el.height() < $(window).height()
+        if (enoughSpace && $(window).scrollTop() > this.origTop) {
+            if (!this.$standin) {
+                this.$standin = $('<' + this.$el.prop('nodeName') + '>')
+                    .css({
+                        width: this.$el.width(),
+                        height: this.$el.height()
+                    })
+                    .attr('class', this.$el.attr('class'))
+                    .addClass('scroll-fixed-standin')
+
+                this.$el
+                    .addClass('scroll-fixed')
+                    .css({
+                        position: 'fixed',
+                        top: 0
+                    })
+                this.$el.before(this.$standin)
+            }
+        } else {
+            if (this.$standin) {
+                this.$el
+                    .removeClass('scroll-fixed')
+                    .css({
+                        position: '',
+                        top: ''
+                    })
+                this.$standin.remove()
+                this.$standin = null
+            }
+        }
+    }
+}
+
+r.ui.ConfirmButton = Backbone.View.extend({
+    confirmTemplate: _.template('<span class="confirmation"><span class="prompt"><%- are_you_sure %></span><button class="yes"><%- yes %></button> / <button class="no"><%- no %></button></div>'),
+    events: {
+        'click': 'click'
+    },
+
+    initialize: function() {
+        // wrap the specified element in a <span> and move its classes over to
+        // the wrapper. this is intended for progressive enhancement of a bare
+        // <button> element.
+        this.$target = this.$el
+        this.$target.wrap('<span>')
+        this.setElement(this.$target.parent())
+        this.$el
+            .attr('class', this.$target.attr('class'))
+            .addClass('confirm-button')
+        this.$target.attr('class', null)
+    },
+
+    click: function(ev) {
+        var target = $(ev.target)
+        if (this.$target.is(target)) {
+            this.$target.hide()
+            this.$el.append(this.confirmTemplate({
+                are_you_sure: r._('are you sure?'),
+                yes: r._('yes'),
+                no: r._('no')
+            }))
+        } else if (target.is('.no')) {
+            this.$('.confirmation').remove()
+            this.$target.show()
+        } else if (target.is('.yes')) {
+            this.$target.trigger('confirm')
+        }
+    }
+})
+
+r.ui.SubredditSubmitText = Backbone.View.extend({
+    initialize: function() {
+        this.lookup = _.throttle(this._lookup, 500)
+        this.cache = new r.utils.LRUCache()
+        this.$input = $('#sr-autocomplete')
+        this.$input.on('sr-changed change input', _.bind(this.lookup, this))
+        this.$sr = this.$el.find('.sr').first()
+        this.$content = this.$el.find('.content').first()
+        if (this.$content.text().trim()) {
+            this.$sr.text(r.config.post_site)
+            this.show()
+        }
+    },
+
+    _lookup: function() {
+        this.$content.empty()
+        var sr = this.$input.val()
+        this.$sr.text(sr)
+        this.$el.addClass('working')
+        if (this.req && this.req.abort) {
+            this.req.abort()
+        }
+        this.req = this.cache.ajax(sr, {
+            url: '/r/' + sr + '/api/submit_text/.json',
+            dataType: 'json'
+        }).done(_.bind(this.settext, this, sr))
+          .fail(_.bind(this.error, this))
+    },
+
+    show: function() {
+        this.$el.addClass('enabled')
+    },
+
+    hide: function() {
+        this.$el.removeClass('enabled')
+    },
+
+    error: function() {
+        delete this.req
+        this.hide()
+    },
+
+    settext: function(sr, data) {
+        delete this.req
+        if (!data.submit_text || !data.submit_text.trim()) {
+            this.hide()
+        } else {
+            this.$sr.text(sr)
+            this.$content.html($.unsafe(data.submit_text_html))
+            this.$el.removeClass('working')
+            this.show()
+        }
     }
 })

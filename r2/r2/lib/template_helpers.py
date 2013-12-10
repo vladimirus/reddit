@@ -22,11 +22,10 @@
 
 from r2.models import *
 from filters import unsafe, websafe, _force_unicode, _force_utf8
-from r2.lib.utils import vote_hash, UrlParser, timesince, is_subdomain
+from r2.lib.utils import UrlParser, timesince, is_subdomain
 
 from r2.lib import hooks
 from r2.lib.static import static_mtime
-from r2.lib.media import s3_direct_url
 from r2.lib import js
 
 import babel.numbers
@@ -36,6 +35,8 @@ from copy import copy
 import random
 import urlparse
 import calendar
+import math
+import time
 from pylons import g, c, request
 from pylons.i18n import _, ungettext
 
@@ -65,13 +66,13 @@ def static(path, allow_gzip=True):
     actual_filename = None
 
     if not c.secure and g.static_domain:
-        scheme = 'http'
+        scheme = "http"
         domain = g.static_domain
-        suffix = '.gzip' if should_gzip and g.static_pre_gzipped else ''
+        suffix = ".gzip" if should_gzip and g.static_pre_gzipped else ""
     elif c.secure and g.static_secure_domain:
-        scheme = 'https'
+        scheme = "https"
         domain = g.static_secure_domain
-        suffix = '.gzip' if should_gzip and g.static_secure_pre_gzipped else ''
+        suffix = ".gzip" if should_gzip and g.static_secure_pre_gzipped else ""
     else:
         path_components.append(c.site.static_path)
 
@@ -85,7 +86,7 @@ def static(path, allow_gzip=True):
 
         scheme = None
         domain = None
-        suffix = ''
+        suffix = ""
 
     path_components.append(dirname)
     if not actual_filename:
@@ -95,7 +96,7 @@ def static(path, allow_gzip=True):
     actual_path = os.path.join(*path_components)
 
     query = None
-    if should_cache_bust:
+    if path and should_cache_bust:
         file_id = static_mtime(actual_path) or random.randint(0, 1000000)
         query = 'v=' + str(file_id)
 
@@ -108,27 +109,30 @@ def static(path, allow_gzip=True):
     ))
 
 
-def s3_https_if_secure(url):
-    # In the event that more media sources (other than s3) are added, this function should be corrected
+def media_https_if_secure(url):
     if not c.secure:
         return url
-    replace = "https://"
-    if not url.startswith("http://%s" % s3_direct_url):
-         replace = "https://%s/" % s3_direct_url
-    return url.replace("http://", replace)
+    return g.media_provider.convert_to_https(url)
+
 
 def js_config(extra_config=None):
+    logged = c.user_is_loggedin and c.user.name
+    gold = bool(logged and c.user.gold)
+
     config = {
         # is the user logged in?
-        "logged": c.user_is_loggedin and c.user.name,
+        "logged": logged,
         # the subreddit's name (for posts)
         "post_site": c.site.name if not c.default_sr else "",
-        # are we in an iframe?
-        "cnameframe": bool(c.cname and not c.authorized_cname),
         # the user's voting hash
         "modhash": c.modhash or False,
         # the current rendering style
         "renderstyle": c.render_style,
+
+        # they're welcome to try to override this in the DOM because we just
+        # disable the features server-side if applicable
+        'store_visits': gold and c.user.pref_store_visits,
+
         # current domain
         "cur_domain": get_domain(cname=c.frameless_cname, subreddit=False, no_www=True),
         # where do ajax requests go?
@@ -137,8 +141,8 @@ def js_config(extra_config=None):
         "https_endpoint": is_subdomain(request.host, g.domain) and g.https_endpoint,
         # debugging?
         "debug": g.debug,
-        "vl": {},
-        "sr": {},
+        "send_logs": g.live_config["frontend_logging"],
+        "server_time": math.floor(time.time()),
         "status_msg": {
           "fetching": _("fetching title..."),
           "submitting": _("submitting..."),
@@ -150,6 +154,8 @@ def js_config(extra_config=None):
         "clicktracker_url": g.clicktracker_url,
         "uitracker_url": g.uitracker_url,
         "static_root": static(''),
+        "over_18": bool(c.over18),
+        "vote_hash": c.vote_hash,
     }
 
     if extra_config:
@@ -168,6 +174,12 @@ class JSPreload(js.DataSource):
 
     def set(self, url, data):
         self.data[url] = data
+
+    def set_wrapped(self, url, wrapped):
+        from r2.lib.pages.things import wrap_things
+        if not isinstance(wrapped, Wrapped):
+            wrapped = wrap_things(wrapped)[0]
+        self.data[url] = wrapped.render_nocache('', style='api').finalize()
 
     def use(self):
         hooks.get_hook("js_preload.use").call(js_preload=self)
@@ -236,36 +248,9 @@ def replace_render(listing, item, render_func):
             replacements['childlisting'] = ''
 
         #only LinkListing has a show_nums attribute
-        if listing:
-            if hasattr(listing, "show_nums"):
-                if listing.show_nums:
-                    num_str = str(item.num)
-                    if hasattr(listing, "num_margin"):
-                        num_margin = str(listing.num_margin)
-                    else:
-                        num_margin = "%.2fex" % (len(str(listing.max_num))*1.1)
-                else:
-                    num_str = ''
-                    num_margin = "0px;display:none"
+        if listing and hasattr(listing, "show_nums"):
+            replacements["num"] = str(item.num) if listing.show_nums else ""
 
-                replacements["numcolmargin"] = num_margin
-                replacements["num"] = num_str
-
-            if hasattr(listing, "max_score"):
-                mid_margin = len(str(listing.max_score))
-                if hasattr(listing, "mid_margin"):
-                    mid_margin = str(listing.mid_margin)
-                elif mid_margin == 1:
-                    mid_margin = "15px"
-                else:
-                    mid_margin = "%dex" % (mid_margin+1)
-
-                replacements["midcolmargin"] = mid_margin
-
-            #$votehash is only present when voting arrows are present
-            if c.user_is_loggedin:
-                replacements['votehash'] = vote_hash(c.user, item,
-                                                     listing.vote_hash_type)
         if hasattr(item, "num_comments"):
             com_label, com_cls = comment_label(item.num_comments)
             if style == "compact":
@@ -465,17 +450,12 @@ def choose_width(link, width):
         else:
             return 110
 
-def panel_size(state):
-    "the frame.cols of the reddit-toolbar's inner frame"
-    return '400px, 100%' if state =='expanded' else '0px, 100%x'
-
 # Appends to the list "attrs" a tuple of:
 # <priority (higher trumps lower), letter,
-#  css class, i18n'ed mouseover label, hyperlink (opt), img (opt)>
+#  css class, i18n'ed mouseover label, hyperlink (opt)>
 def add_attr(attrs, kind, label=None, link=None, cssclass=None, symbol=None):
     from r2.lib.template_helpers import static
 
-    img = None
     symbol = symbol or kind
 
     if kind == 'F':
@@ -523,10 +503,10 @@ def add_attr(attrs, kind, label=None, link=None, cssclass=None, symbol=None):
             raise ValueError ("Need a label")
     elif kind == 'special':
         priority = 98
-    elif kind.startswith ('trophy:'):
-        img = (kind[7:], '!', 11, 8)
+    elif kind == "cake":
         priority = 99
-        cssclass = 'recent-trophywinner'
+        cssclass = "cakeday"
+        symbol = "&#x1F370;"
         if not label:
             raise ValueError ("Need a label")
         if not link:
@@ -534,7 +514,7 @@ def add_attr(attrs, kind, label=None, link=None, cssclass=None, symbol=None):
     else:
         raise ValueError ("Got weird kind [%s]" % kind)
 
-    attrs.append( (priority, symbol, cssclass, label, link, img) )
+    attrs.append( (priority, symbol, cssclass, label, link) )
 
 
 def search_url(query, subreddit, restrict_sr="off", sort=None, recent=None):

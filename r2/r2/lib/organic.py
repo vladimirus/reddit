@@ -21,8 +21,7 @@
 ###############################################################################
 
 from r2.models import *
-from r2.lib.memoize import memoize
-from r2.lib.normalized_hot import get_hot
+from r2.lib.normalized_hot import normalized_hot
 from r2.lib import count
 from r2.lib.utils import UniqueIterator, timeago
 
@@ -31,7 +30,6 @@ from pylons import c
 import random
 from time import time
 
-organic_lifetime = 5*60
 organic_max_length= 50
 
 def keep_fresh_links(item):
@@ -43,11 +41,10 @@ def keep_fresh_links(item):
 
     from r2.lib.promote import is_promo
     if is_promo(item):
-        return not item.hidden
+        return (not item.over_18 or c.over18) and not item.hidden
 
     return item.fresh
 
-@memoize('cached_organic_links', time = organic_lifetime)
 def cached_organic_links(*sr_ids):
     sr_count = count.get_link_counts()
     #only use links from reddits that you're subscribed to
@@ -62,8 +59,8 @@ def cached_organic_links(*sr_ids):
 
     #potentially add an up and coming link
     if random.choice((True, False)) and sr_ids:
-        sr = Subreddit._byID(random.choice(sr_ids))
-        fnames = get_hot([sr])
+        sr_id = random.choice(sr_ids)
+        fnames = normalized_hot([sr_id])
         if fnames:
             if len(fnames) == 1:
                 new_item = fnames[0]

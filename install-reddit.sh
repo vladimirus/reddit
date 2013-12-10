@@ -94,6 +94,10 @@ fi
 APTITUDE_OPTIONS="-y" # limit bandwidth: -o Acquire::http::Dl-Limit=100"
 export DEBIAN_FRONTEND=noninteractive
 
+# run an aptitude update to make sure python-software-properties
+# dependencies are found
+apt-get update
+
 # add the reddit ppa for some custom packages
 apt-get install $APTITUDE_OPTIONS python-software-properties
 apt-add-repository -y ppa:reddit/ppa
@@ -127,7 +131,6 @@ python-beautifulsoup
 python-cssutils
 python-chardet
 python-psycopg2
-python-pycountry
 python-pycassa
 python-imaging
 python-pycaptcha
@@ -142,6 +145,7 @@ python-kazoo
 python-stripe
 
 nodejs
+node-less
 gettext
 make
 optipng
@@ -153,6 +157,9 @@ postgresql-client
 rabbitmq-server
 cassandra
 haproxy
+nginx
+stunnel
+netcat-openbsd
 PACKAGES
 
 ###############################################################################
@@ -272,6 +279,11 @@ set debug = true
 
 domain = $REDDIT_DOMAIN
 
+media_provider = filesystem
+media_fs_root = /srv/www/media
+media_fs_base_url_http = http://%(domain)s/media/
+media_fs_base_url_https = https://%(domain)s/media/
+
 [server:main]
 port = 8001
 DEVELOPMENT
@@ -292,6 +304,11 @@ set debug = false
 
 domain = $REDDIT_DOMAIN
 
+media_provider = filesystem
+media_fs_root = /srv/www/media
+media_fs_base_url_http = http://%(domain)s/media/
+media_fs_base_url_https = https://%(domain)s/media/
+
 [server:main]
 port = 8001
 PRODUCTION
@@ -303,6 +320,32 @@ sudo -u $REDDIT_OWNER make ini
 if [ ! -L run.ini ]; then
     sudo -u $REDDIT_OWNER ln -s development.ini run.ini
 fi
+
+###############################################################################
+# nginx
+###############################################################################
+
+mkdir -p /srv/www/media
+chown $REDDIT_USER:$REDDIT_GROUP /srv/www/media
+
+cat > /etc/nginx/sites-available/reddit-media <<MEDIA
+server {
+    listen 9000;
+
+    expires max;
+
+    location /media/ {
+        alias /srv/www/media/;
+    }
+}
+MEDIA
+
+# remove the default nginx site that may conflict with haproxy
+rm /etc/nginx/sites-enabled/default
+# put our config in place
+ln -s /etc/nginx/sites-available/reddit-media /etc/nginx/sites-enabled/
+
+service nginx restart
 
 ###############################################################################
 # haproxy
@@ -323,11 +366,24 @@ cat > /etc/haproxy/haproxy.cfg <<HAPROXY
 global
     maxconn 100
 
-frontend frontend 0.0.0.0:80
+frontend frontend
     mode http
+
+    bind 0.0.0.0:80
+    bind 0.0.0.0:8080
+
     timeout client 10000
     option forwardfor except 127.0.0.1
     option httpclose
+
+    # make sure that requests have x-forwarded-proto: https iff tls
+    reqidel ^X-Forwarded-Proto:.*
+    acl is-ssl dst_port 8080
+    reqadd X-Forwarded-Proto:\ https if is-ssl
+
+    # send media stuff to the local nginx
+    acl is-media path_beg /media/
+    use_backend media if is-media
 
     default_backend dynamic
 
@@ -339,10 +395,63 @@ backend dynamic
     balance roundrobin
 
     server app01-8001 localhost:8001 maxconn 1
+
+backend media
+    mode http
+    timeout connect 4000
+    timeout server 30000
+    timeout queue 60000
+    balance roundrobin
+
+    server nginx localhost:9000 maxconn 20
 HAPROXY
 
 # this will start it even if currently stopped
 service haproxy restart
+
+###############################################################################
+# stunnel
+###############################################################################
+cat > /etc/stunnel/stunnel.conf <<STUNNELCONF
+foreground = no
+
+; replace these with real certificates
+cert = /etc/ssl/certs/ssl-cert-snakeoil.pem
+key = /etc/ssl/private/ssl-cert-snakeoil.key
+
+; protocol version and ciphers
+sslVersion = all
+ciphers = ECDHE-RSA-RC4-SHA:ECDHE-ECDSA-RC4-SHA:ECDH-RSA-RC4-SHA:ECDH-ECDSA-RC4-SHA:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:SRP-DSS-AES-256-CBC-SHA:SRP-RSA-AES-256-CBC-SHA:DHE-DSS-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-SHA256:DHE-DSS-AES256-SHA256:DHE-RSA-AES256-SHA:DHE-DSS-AES256-SHA:DHE-RSA-CAMELLIA256-SHA:DHE-DSS-CAMELLIA256-SHA:ECDH-RSA-AES256-GCM-SHA384:ECDH-ECDSA-AES256-GCM-SHA384:ECDH-RSA-AES256-SHA384:ECDH-ECDSA-AES256-SHA384:ECDH-RSA-AES256-SHA:ECDH-ECDSA-AES256-SHA:AES256-GCM-SHA384:AES256-SHA256:AES256-SHA:CAMELLIA256-SHA:PSK-AES256-CBC-SHA:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES128-SHA:SRP-DSS-AES-128-CBC-SHA:SRP-RSA-AES-128-CBC-SHA:DHE-DSS-AES128-GCM-SHA256:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES128-SHA256:DHE-DSS-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-DSS-AES128-SHA:DHE-RSA-SEED-SHA:DHE-DSS-SEED-SHA:DHE-RSA-CAMELLIA128-SHA:DHE-DSS-CAMELLIA128-SHA:ECDH-RSA-AES128-GCM-SHA256:ECDH-ECDSA-AES128-GCM-SHA256:ECDH-RSA-AES128-SHA256:ECDH-ECDSA-AES128-SHA256:ECDH-RSA-AES128-SHA:ECDH-ECDSA-AES128-SHA:AES128-GCM-SHA256:AES128-SHA256:AES128-SHA:SEED-SHA:CAMELLIA128-SHA:PSK-AES128-CBC-SHA:RC4-SHA:DES-CBC3-SHA:RC4-MD5
+options = NO_SSLv2
+options = DONT_INSERT_EMPTY_FRAGMENTS
+options = CIPHER_SERVER_PREFERENCE
+
+; security
+chroot = /var/lib/stunnel4/
+setuid = stunnel4
+setgid = stunnel4
+pid = /stunnel4.pid
+
+; performance
+socket = l:TCP_NODELAY=1
+socket = r:TCP_NODELAY=1
+
+; logging
+output = /var/log/stunnel4/stunnel.log
+syslog = no
+
+[https]
+accept = 443
+connect = 8080
+TIMEOUTclose = 0
+sslVersion = all
+; this requires a patched version of stunnel which is in the reddit ppa
+xforwardedfor = yes
+STUNNELCONF
+
+sed -i s/ENABLED=0/ENABLED=1/ /etc/default/stunnel4
+
+service stunnel4 restart
 
 ###############################################################################
 # Upstart Environment
@@ -375,11 +484,13 @@ function set_consumer_count {
 
 set_consumer_count log_q 0
 set_consumer_count cloudsearch_q 0
-set_consumer_count scraper_q 0
+set_consumer_count scraper_q 1
 set_consumer_count commentstree_q 1
 set_consumer_count newcomments_q 1
 set_consumer_count vote_link_q 1
 set_consumer_count vote_comment_q 1
+
+chown -R $REDDIT_OWNER:$REDDIT_GROUP $CONSUMER_CONFIG_ROOT/
 
 initctl emit reddit-start
 
@@ -397,7 +508,6 @@ if [ ! -f /etc/cron.d/reddit ]; then
 */2  * * * * root /sbin/start --quiet reddit-job-rising
 
 # disabled by default, uncomment if you need these jobs
-#*/2  * * * * root /sbin/start --quiet reddit-job-google_checkout
 #0    0 * * * root /sbin/start --quiet reddit-job-update_gold_users
 CRON
 fi

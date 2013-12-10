@@ -42,7 +42,7 @@ class PostController(ApiController):
         elif all_langs == 'some':
             langs = []
             for lang in g.all_languages:
-                if request.post.get('lang-' + lang):
+                if request.POST.get('lang-' + lang):
                     langs.append(str(lang)) #unicode
             if langs:
                 langs.sort()
@@ -83,6 +83,7 @@ class PostController(ApiController):
               pref_lang = VLang('lang'),
               pref_media = VOneOf('media', ('on', 'off', 'subreddit')),
               pref_compress = VBoolean('compress'),
+              pref_domain_details = VBoolean('domain_details'),
               pref_min_link_score = VInt('min_link_score', -100, 100),
               pref_min_comment_score = VInt('min_comment_score', -100, 100),
               pref_num_comments = VInt('num_comments', 1, g.max_comments,
@@ -98,10 +99,12 @@ class PostController(ApiController):
               pref_collapse_read_messages = VBoolean("collapse_read_messages"),
               pref_private_feeds = VBoolean("private_feeds"),
               pref_local_js = VBoolean('local_js'),
+              pref_store_visits = VBoolean('store_visits'),
               pref_show_adbox = VBoolean("show_adbox"),
               pref_show_sponsors = VBoolean("show_sponsors"),
               pref_show_sponsorships = VBoolean("show_sponsorships"),
               pref_highlight_new_comments = VBoolean("highlight_new_comments"),
+              pref_monitor_mentions=VBoolean("monitor_mentions"),
               all_langs = VOneOf('all-langs', ('all', 'some'), default='all'))
     def POST_options(self, all_langs, pref_lang, **kw):
         #temporary. eventually we'll change pref_clickgadget to an
@@ -118,10 +121,14 @@ class PostController(ApiController):
         if kw.get("pref_no_profanity") or c.user.pref_no_profanity:
             kw['pref_label_nsfw'] = True
 
+        # default all the gold options to on if they don't have gold
         if not c.user.gold:
-            kw['pref_show_adbox'] = True
-            kw['pref_show_sponsors'] = True
-            kw['pref_show_sponsorships'] = True
+            for pref in ('pref_show_adbox',
+                         'pref_show_sponsors',
+                         'pref_show_sponsorships',
+                         'pref_highlight_new_comments',
+                         'pref_monitor_mentions'):
+                kw[pref] = True
 
         self.set_options(all_langs, pref_lang, **kw)
         u = UrlParser(c.site.path + "prefs")
@@ -177,7 +184,7 @@ class PostController(ApiController):
         response.content_type = "text/html"
 
         if c.errors:
-            return LoginPage(user_login = request.post.get('user'),
+            return LoginPage(user_login = request.POST.get('user'),
                              dest = dest).render()
 
         return self.redirect(dest)
@@ -189,7 +196,7 @@ class PostController(ApiController):
         response.content_type = "text/html"
 
         if c.errors:
-            return LoginPage(user_reg = request.post.get('user'),
+            return LoginPage(user_reg = request.POST.get('user'),
                              dest = dest).render()
 
         return self.redirect(dest)

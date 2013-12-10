@@ -21,82 +21,120 @@
 ###############################################################################
 from datetime import datetime, timedelta
 
-import itertools
+from babel.numbers import format_number
 import json
+import urllib
 
 from pylons import c, g, request
 from pylons.i18n import _
 
 from r2.controllers.listingcontroller import ListingController
-from r2.lib import cssfilter, promote
+from r2.lib import cssfilter, inventory, promote
 from r2.lib.authorize import get_account_info, edit_profile, PROFILE_LIMIT
 from r2.lib.db import queries
 from r2.lib.errors import errors
 from r2.lib.media import force_thumbnail, thumbnail_url
+from r2.lib.memoize import memoize
+from r2.lib.menus import NamedButton, NavButton, NavMenu
 from r2.lib.pages import (
     LinkInfoPage,
     PaymentForm,
-    PromoAdminTool,
-    Promote_Graph,
+    PromoteInventory,
     PromotePage,
     PromoteLinkForm,
-    PromoteLinkFormCpm,
+    PromoteLinkNew,
+    PromoteReport,
+    Reddit,
+    RefundPage,
     Roadblocks,
     UploadedImage,
 )
 from r2.lib.pages.trafficpages import TrafficViewerList
 from r2.lib.pages.things import wrap_links
 from r2.lib.system_messages import user_added_messages
-from r2.lib.utils import make_offset_date
+from r2.lib.utils import make_offset_date, to_date, to36
 from r2.lib.validator import (
+    json_validate,
     nop,
     noresponse,
+    VAccountByName,
     ValidAddress,
     validate,
     validatedForm,
     ValidCard,
     ValidIP,
+    VBid,
     VBoolean,
     VByName,
     VDate,
     VDateRange,
     VExistingUname,
     VFloat,
+    VImageType,
     VInt,
     VLength,
     VLink,
     VModhash,
     VOneOf,
+    VPriority,
     VPromoCampaign,
     VRatelimit,
+    VSelfText,
+    VShamedDomain,
     VSponsor,
     VSponsorAdmin,
+    VSponsorAdminOrAdminSecret,
     VSubmitSR,
     VTitle,
+    VUploadLength,
     VUrl,
 )
-from r2.models import Link, Message, NotFound, PromoCampaign, PromotionLog
+from r2.models import (
+    Account,
+    calc_impressions,
+    Frontpage,
+    get_promote_srid,
+    Link,
+    Message,
+    NotFound,
+    PromoCampaign,
+    PromotionLog,
+    PromotionWeights,
+    PromotedLinkRoadblock,
+    Subreddit,
+)
 
 
-def _check_dates(dates):
-    params = ('startdate', 'enddate')
-    error_types = (errors.BAD_DATE,
-                   errors.BAD_FUTURE_DATE,
-                   errors.BAD_PAST_DATE,
-                   errors.BAD_DATE_RANGE,
-                   errors.DATE_RANGE_TOO_LARGE)
-    for error_case in itertools.product(error_types, params):
-        if error_case in c.errors:
-            bad_dates = dates
-            start, end = None, None
-            break
-    else:
-        bad_dates = None
-        start, end = dates
-    if not start or not end:
-        start = promote.promo_datetime_now(offset=-7).date()
-        end = promote.promo_datetime_now(offset=6).date()
-    return start, end, bad_dates
+def campaign_has_oversold_error(form, campaign):
+    if campaign.priority.inventory_override:
+        return
+
+    target = Subreddit._by_name(campaign.sr_name) if campaign.sr_name else None
+    return has_oversold_error(form, campaign, campaign.start_date,
+                              campaign.end_date, campaign.bid, campaign.cpm,
+                              target)
+
+
+def has_oversold_error(form, campaign, start, end, bid, cpm, target):
+    ndays = (to_date(end) - to_date(start)).days
+    total_request = calc_impressions(bid, cpm)
+    daily_request = int(total_request / ndays)
+    oversold = inventory.get_oversold(target or Frontpage, start, end,
+                                      daily_request, ignore=campaign)
+
+    if oversold:
+        min_daily = min(oversold.values())
+        available = min_daily * ndays
+        msg_params = {
+            'available': format_number(available, locale=c.locale),
+            'target': target.name if target else 'the frontpage',
+            'start': start.strftime('%m/%d/%Y'),
+            'end': end.strftime('%m/%d/%Y'),
+        }
+        c.errors.add(errors.OVERSOLD_DETAIL, field='bid',
+                     msg_params=msg_params)
+        form.has_errors('bid', errors.OVERSOLD_DETAIL)
+        return True
 
 
 class PromoteController(ListingController):
@@ -106,6 +144,59 @@ class PromoteController(ListingController):
     @property
     def title_text(self):
         return _('promoted by you')
+
+    @classmethod
+    @memoize('live_by_subreddit', time=300)
+    def _live_by_subreddit(cls, sr_names):
+        promotuples = promote.get_live_promotions(sr_names)
+        return [pt.link for pt in promotuples]
+
+    def live_by_subreddit(cls, sr):
+        sr_names = [''] if sr == Frontpage else [sr.name]
+        return cls._live_by_subreddit(sr_names)
+
+    @classmethod
+    @memoize('house_link_names', time=60)
+    def get_house_link_names(cls):
+        now = promote.promo_datetime_now()
+        pws = PromotionWeights.get_campaigns(now)
+        campaign_ids = {pw.promo_idx for pw in pws}
+        q = PromoCampaign._query(PromoCampaign.c._id.in_(campaign_ids),
+                                 PromoCampaign.c.priority_name == 'house',
+                                 data=True)
+        return [Link._fullname_from_id36(to36(camp.link_id)) for camp in q]
+
+    @property
+    def menus(self):
+        filters = [
+            NamedButton('all_promos', dest=''),
+            NamedButton('future_promos'),
+            NamedButton('unpaid_promos'),
+            NamedButton('rejected_promos'),
+            NamedButton('pending_promos'),
+            NamedButton('live_promos'),
+        ]
+        menus = [NavMenu(filters, base_path='/promoted', title='show',
+                        type='lightdrop')]
+
+        if self.sort == 'live_promos' and c.user_is_sponsor:
+            srnames = promote.all_live_promo_srnames()
+            buttons = [NavButton('all', '')]
+            try:
+                srnames.remove('')
+                frontbutton = NavButton('FRONTPAGE', Frontpage.name,
+                                        aliases=['/promoted/live_promos/%s' %
+                                                 urllib.quote(Frontpage.name)])
+                buttons.append(frontbutton)
+            except KeyError:
+                pass
+
+            srnames = sorted(srnames, key=lambda name: name.lower())
+            buttons.extend([NavButton(name, name) for name in srnames])
+            menus.append(NavMenu(buttons, base_path='/promoted/live_promos',
+                                 title='subreddit', type='lightdrop'))
+
+        return menus
 
     def keep_fn(self):
         def keep(item):
@@ -125,8 +216,20 @@ class PromoteController(ListingController):
                 return queries.get_all_unpaid_links()
             elif self.sort == "rejected_promos":
                 return queries.get_all_rejected_links()
-            elif self.sort == "live_promos":
+            elif self.sort == "live_promos" and self.sr:
+                return self.live_by_subreddit(self.sr)
+            elif self.sort == 'live_promos':
                 return queries.get_all_live_links()
+            elif self.sort == 'underdelivered':
+                q = queries.get_underdelivered_campaigns()
+                campaigns = PromoCampaign._by_fullname(list(q), data=True,
+                                                       return_dict=False)
+                link_ids = [camp.link_id for camp in campaigns]
+                return [Link._fullname_from_id36(to36(id)) for id in link_ids]
+            elif self.sort == 'reported':
+                return queries.get_reported_links(get_promote_srid())
+            elif self.sort == 'house':
+                return self.get_house_link_names()
             return queries.get_all_promoted_links()
         else:
             if self.sort == "future_promos":
@@ -141,53 +244,38 @@ class PromoteController(ListingController):
                 return queries.get_live_links(c.user._id)
             return queries.get_promoted_links(c.user._id)
 
-    @validate(VSponsor())
-    def GET_listing(self, sort="", **env):
+    @validate(VSponsor(),
+              sr=nop('sr'))
+    def GET_listing(self, sr=None, sort="", **env):
         if not c.user_is_loggedin or not c.user.email_verified:
+            # never reached--see MinimalController.on_validation_error
             return self.redirect("/ad_inq")
         self.sort = sort
+        self.sr = None
+        if sr and sr == Frontpage.name:
+            self.sr = Frontpage
+        elif sr:
+            try:
+                self.sr = Subreddit._by_name(sr)
+            except NotFound:
+                pass
         return ListingController.GET_listing(self, **env)
 
     GET_index = GET_listing
 
     @validate(VSponsor())
     def GET_new_promo(self):
-        return PromotePage('content', content=PromoteLinkForm()).render()
+        return PromotePage('content', content=PromoteLinkNew()).render()
 
     @validate(VSponsor('link'),
               link=VLink('link'))
     def GET_edit_promo(self, link):
         if not link or link.promoted is None:
             return self.abort404()
-        rendered = wrap_links(link, wrapper=promote.sponsor_wrapper,
-                              skip=False)
-
-        form = PromoteLinkForm(link=link,
-                               listing=rendered,
-                               timedeltatext="")
-
+        rendered = wrap_links(link, skip=False)
+        form = PromoteLinkForm(link, rendered)
         page = PromotePage('new_promo', content=form)
-
         return page.render()
-
-
-    # For development. Should eventually replace GET_edit_promo
-    @validate(VSponsor('link'),
-              link=VLink('link'))
-    def GET_edit_promo_cpm(self, link):
-        if not link or link.promoted is None:
-            return self.abort404()
-        rendered = wrap_links(link, wrapper=promote.sponsor_wrapper,
-                              skip=False)
-
-        form = PromoteLinkFormCpm(link=link,
-                                  listing=rendered,
-                                  timedeltatext="")
-
-        page = PromotePage('new_promo', content=form)
-
-        return page.render()
-
 
     # admin only because the route might change
     @validate(VSponsorAdmin('campaign'),
@@ -198,58 +286,47 @@ class PromoteController(ListingController):
         link = Link._byID(campaign.link_id)
         return self.redirect(promote.promo_edit_url(link))
 
-    @validate(VSponsor(),
-              dates=VDateRange(["startdate", "enddate"],
-                               max_range=timedelta(days=28),
-                               required=False))
-    def GET_graph(self, dates):
-        start, end, bad_dates = _check_dates(dates)
-        return PromotePage("graph",
-                           content=Promote_Graph(
-                                start, end, bad_dates=bad_dates)
-                           ).render()
+    @json_validate(sr=VSubmitSR('sr', promotion=True),
+                   start=VDate('startdate'),
+                   end=VDate('enddate'))
+    def GET_check_inventory(self, responder, sr, start, end):
+        sr = sr or Frontpage
+        available_by_datestr = inventory.get_available_pageviews(sr, start, end,
+                                                                 datestr=True)
+        return {'inventory': available_by_datestr}
 
-    @validate(VSponsorAdmin(),
-              dates=VDateRange(["startdate", "enddate"],
-                               max_range=timedelta(days=28),
-                               required=False))
-    def GET_admingraph(self, dates):
-        start, end, bad_dates = _check_dates(dates)
-        content = Promote_Graph(start, end, bad_dates=bad_dates,
-                                admin_view=True)
-        if c.render_style == 'csv':
-            return content.as_csv()
-        return PromotePage("admingraph", content=content).render()
+    @validate(
+        VSponsorAdmin(),
+        start=VDate('startdate', reference_date=promote.promo_datetime_now),
+        end=VDate('enddate', reference_date=promote.promo_datetime_now),
+        sr_name=nop('sr_name'),
+    )
+    def GET_promote_inventory(self, start, end, sr_name):
+        if not start or not end:
+            start = promote.promo_datetime_now(offset=1).date()
+            end = promote.promo_datetime_now(offset=8).date()
+            c.errors.remove((errors.BAD_DATE, 'startdate'))
+            c.errors.remove((errors.BAD_DATE, 'enddate'))
 
-    def GET_inventory(self, sr_name):
-        '''
-        Return available inventory data as json for use in ajax calls
-        '''
-        inv_start_date = promote.promo_datetime_now()
-        inv_end_date = inv_start_date + timedelta(60)
-        inventory = promote.get_available_impressions(
-            sr_name,
-            inv_start_date,
-            inv_end_date,
-            fuzzed=(not c.user_is_admin)
-        )
-        dates = []
-        impressions = []
-        max_imps = 0
-        for date, imps in inventory.iteritems():
-            dates.append(date.strftime("%m/%d/%Y"))
-            impressions.append(imps)
-            max_imps = max(max_imps, imps)
-        return json.dumps({'sr':sr_name,
-                           'dates': dates,
-                           'imps':impressions,
-                           'max_imps':max_imps})
+        sr = Frontpage
+        if sr_name:
+            try:
+                sr = Subreddit._by_name(sr_name)
+            except NotFound:
+                c.errors.add(errors.SUBREDDIT_NOEXIST, field='sr_name')
+
+        content = PromoteInventory(start, end, sr)
+        return PromotePage("promote_inventory", content=content).render()
 
     # ## POST controllers below
     @validatedForm(VSponsorAdmin(),
                    link=VLink("link_id"),
                    campaign=VPromoCampaign("campaign_id36"))
     def POST_freebie(self, form, jquery, link, campaign):
+        if campaign_has_oversold_error(form, campaign):
+            form.set_html(".freebie", "target oversold, can't freebie")
+            return
+
         if promote.is_promo(link) and campaign:
             promote.free_campaign(link, campaign, c.user)
             form.redirect(promote.promo_edit_url(link))
@@ -277,45 +354,87 @@ class PromoteController(ListingController):
         if promote.is_promo(thing):
             promote.reject_promotion(thing, reason=reason)
 
+    @validate(VSponsorAdmin(),
+              link=VLink("link"),
+              campaign=VPromoCampaign("campaign"))
+    def GET_refund(self, link, campaign):
+        if campaign.link_id != link._id:
+            return self.abort404()
+
+        content = RefundPage(link, campaign)
+        return Reddit("refund", content=content, show_sidebar=False).render()
+
+    @validatedForm(VSponsorAdmin(),
+                   link=VLink('link'),
+                   campaign=VPromoCampaign('campaign'))
+    def POST_refund_campaign(self, form, jquery, link, campaign):
+        billable_impressions = promote.get_billable_impressions(campaign)
+        billable_amount = promote.get_billable_amount(campaign,
+                                                      billable_impressions)
+        refund_amount = promote.get_refund_amount(campaign, billable_amount)
+        if refund_amount > 0:
+            promote.refund_campaign(link, campaign, billable_amount,
+                                    billable_impressions)
+            form.set_html('.status', _('refund succeeded'))
+        else:
+            form.set_html('.status', _('refund not needed'))
+
     @validatedForm(VSponsor('link_id'),
                    VModhash(),
                    VRatelimit(rate_user=True,
                               rate_ip=True,
                               prefix='create_promo_'),
+                   VShamedDomain('url'),
+                   username=VLength('username', 100, empty_error=None),
                    l=VLink('link_id'),
                    title=VTitle('title'),
                    url=VUrl('url', allow_self=False, lookup=False),
+                   selftext=VSelfText('text'),
+                   kind=VOneOf('kind', ['link', 'self']),
                    ip=ValidIP(),
                    disable_comments=VBoolean("disable_comments"),
-                   set_clicks=VBoolean("set_maximum_clicks"),
-                   max_clicks=VInt("maximum_clicks", min=0),
-                   set_views=VBoolean("set_maximum_views"),
-                   max_views=VInt("maximum_views", min=0),
                    media_width=VInt("media-width", min=0),
                    media_height=VInt("media-height", min=0),
                    media_embed=VLength("media-embed", 1000),
                    media_override=VBoolean("media-override"),
                    domain_override=VLength("domain", 100)
                    )
-    def POST_edit_promo(self, form, jquery, ip, l, title, url,
-                        disable_comments,
-                        set_clicks, max_clicks,
-                        set_views, max_views,
-                        media_height, media_width, media_embed,
-                        media_override, domain_override):
+    def POST_edit_promo(self, form, jquery, ip, username, l, title, url,
+                        selftext, kind, disable_comments, media_height,
+                        media_width, media_embed, media_override, domain_override):
 
         should_ratelimit = False
         if not c.user_is_sponsor:
-            set_clicks = False
-            set_views = False
             should_ratelimit = True
-        if not set_clicks:
-            max_clicks = None
-        if not set_views:
-            max_views = None
 
         if not should_ratelimit:
             c.errors.remove((errors.RATELIMIT, 'ratelimit'))
+
+        # check for user override
+        if not l and c.user_is_sponsor and username:
+            try:
+                user = Account._by_name(username)
+            except NotFound:
+                c.errors.add(errors.USER_DOESNT_EXIST, field="username")
+                form.set_error(errors.USER_DOESNT_EXIST, "username")
+                return
+
+            if not user.email:
+                c.errors.add(errors.NO_EMAIL_FOR_USER, field="username")
+                form.set_error(errors.NO_EMAIL_FOR_USER, "username")
+                return
+
+            if not user.email_verified:
+                c.errors.add(errors.NO_VERIFIED_EMAIL, field="username")
+                form.set_error(errors.NO_VERIFIED_EMAIL, "username")
+                return
+        else:
+            user = c.user
+
+        # check for shame banned domains
+        if form.has_errors("url", errors.DOMAIN_BANNED):
+            g.stats.simple_event('spam.shame.link')
+            return
 
         # demangle URL in canonical way
         if url:
@@ -327,17 +446,29 @@ class PromoteController(ListingController):
                 # want the URL
                 url = url[0].url
 
+        if kind == 'link':
+            if form.has_errors('url', errors.NO_URL, errors.BAD_URL):
+                return
+
         # users can change the disable_comments on promoted links
         if ((not l or not promote.is_promoted(l)) and
-            (form.has_errors('title', errors.NO_TEXT,
-                            errors.TOO_LONG) or
-            form.has_errors('url', errors.NO_URL, errors.BAD_URL) or
-            jquery.has_errors('ratelimit', errors.RATELIMIT))):
+            (form.has_errors('title', errors.NO_TEXT, errors.TOO_LONG) or
+             jquery.has_errors('ratelimit', errors.RATELIMIT))):
             return
 
         if not l:
-            l = promote.new_promotion(title, url, c.user, ip)
+            l = promote.new_promotion(title, url if kind == 'link' else 'self',
+                                      selftext if kind == 'self' else '',
+                                      user, ip)
+
         elif promote.is_promo(l):
+            # changing link type is not allowed
+            if ((l.is_self and kind == 'link') or
+                (not l.is_self and kind == 'self')):
+                c.errors.add(errors.NO_CHANGE_KIND, field="kind")
+                form.set_error(errors.NO_CHANGE_KIND, "kind")
+                return
+
             changed = False
             # live items can only be changed by a sponsor, and also
             # pay the cost of de-approving the link
@@ -346,19 +477,18 @@ class PromoteController(ListingController):
                 if title and title != l.title:
                     l.title = title
                     changed = not trusted
-                if url and url != l.url:
+
+                if kind == 'link' and url and url != l.url:
                     l.url = url
                     changed = not trusted
 
             # only trips if the title and url are changed by a non-sponsor
             if changed and not promote.is_unpaid(l):
                 promote.unapprove_promotion(l)
-            if trusted and promote.is_unapproved(l):
-                promote.accept_promotion(l)
 
-            if c.user_is_sponsor:
-                l.maximum_clicks = max_clicks
-                l.maximum_views = max_views
+            # selftext can be changed at any time
+            if kind == 'self':
+                l.selftext = selftext
 
             # comment disabling is free to be changed any time.
             l.disable_comments = disable_comments
@@ -385,16 +515,11 @@ class PromoteController(ListingController):
     @validatedForm(VSponsorAdmin(),
                    VModhash(),
                    dates=VDateRange(['startdate', 'enddate'],
-                                      future=1,
-                                      reference_date=promote.promo_datetime_now,
-                                      business_days=False,
-                                      sponsor_override=True),
+                                    reference_date=promote.promo_datetime_now),
                    sr=VSubmitSR('sr', promotion=True))
     def POST_add_roadblock(self, form, jquery, dates, sr):
-        if (form.has_errors('startdate', errors.BAD_DATE,
-                            errors.BAD_FUTURE_DATE) or
-            form.has_errors('enddate', errors.BAD_DATE,
-                            errors.BAD_FUTURE_DATE, errors.BAD_DATE_RANGE)):
+        if (form.has_errors('startdate', errors.BAD_DATE) or
+            form.has_errors('enddate', errors.BAD_DATE, errors.BAD_DATE_RANGE)):
             return
         if form.has_errors('sr', errors.SUBREDDIT_NOEXIST,
                            errors.SUBREDDIT_NOTALLOWED,
@@ -402,44 +527,46 @@ class PromoteController(ListingController):
             return
         if dates and sr:
             sd, ed = dates
-            promote.roadblock_reddit(sr.name, sd.date(), ed.date())
+            PromotedLinkRoadblock.add(sr, sd, ed)
             jquery.refresh()
 
     @validatedForm(VSponsorAdmin(),
                    VModhash(),
                    dates=VDateRange(['startdate', 'enddate'],
-                                      future=1,
-                                      reference_date=promote.promo_datetime_now,
-                                      business_days=False,
-                                      sponsor_override=True),
+                                    reference_date=promote.promo_datetime_now),
                    sr=VSubmitSR('sr', promotion=True))
     def POST_rm_roadblock(self, form, jquery, dates, sr):
         if dates and sr:
             sd, ed = dates
-            promote.unroadblock_reddit(sr.name, sd.date(), ed.date())
+            PromotedLinkRoadblock.remove(sr, sd, ed)
             jquery.refresh()
 
     @validatedForm(VSponsor('link_id'),
                    VModhash(),
                    dates=VDateRange(['startdate', 'enddate'],
-                                  future=1,
-                                  reference_date=promote.promo_datetime_now,
-                                  business_days=False,
-                                  sponsor_override=True),
-                   l=VLink('link_id'),
-                   bid=VFloat('bid', min=0, max=g.max_promote_bid,
-                                  coerce=False, error=errors.BAD_BID),
+                       earliest=timedelta(days=1),
+                       latest=timedelta(days=g.max_promote_future),
+                       reference_date=promote.promo_datetime_now,
+                       business_days=True,
+                       sponsor_override=True),
+                   link=VLink('link_id'),
+                   bid=VBid('bid', min=0, max=g.max_promote_bid,
+                            coerce=False, error=errors.BAD_BID),
                    sr=VSubmitSR('sr', promotion=True),
                    campaign_id36=nop("campaign_id36"),
-                   targeting=VLength("targeting", 10))
-    def POST_edit_campaign(self, form, jquery, l, campaign_id36,
-                          dates, bid, sr, targeting):
-        if not l:
+                   targeting=VLength("targeting", 10),
+                   priority=VPriority("priority"))
+    def POST_edit_campaign(self, form, jquery, link, campaign_id36,
+                          dates, bid, sr, targeting, priority):
+        if not link:
             return
 
         start, end = dates or (None, None)
 
-        if (start and end and not promote.is_accepted(l) and
+        author = Account._byID(link.author_id, data=True)
+        cpm = author.cpm_selfserve_pennies
+
+        if (start and end and not promote.is_accepted(link) and
             not c.user_is_sponsor):
             # if the ad is not approved already, ensure the start date
             # is at least 2 days in the future
@@ -449,21 +576,21 @@ class PromoteController(ListingController):
             future = make_offset_date(now, g.min_promote_future,
                                       business_days=True)
             if start < future.date():
-                c.errors.add(errors.BAD_FUTURE_DATE,
-                             msg_params=dict(day=g.min_promote_future),
+                day = promote.promo_datetime_now(offset=g.min_promote_future)
+                day = day.strftime("%m/%d/%Y")
+                c.errors.add(errors.DATE_TOO_EARLY, msg_params=dict(day=day),
                              field="startdate")
 
-
         if (form.has_errors('startdate', errors.BAD_DATE,
-                            errors.BAD_FUTURE_DATE) or
-            form.has_errors('enddate', errors.BAD_DATE,
-                            errors.BAD_FUTURE_DATE, errors.BAD_DATE_RANGE)):
+                            errors.DATE_TOO_EARLY, errors.DATE_TOO_LATE) or
+            form.has_errors('enddate', errors.BAD_DATE, errors.DATE_TOO_EARLY,
+                            errors.DATE_TOO_LATE, errors.BAD_DATE_RANGE)):
             return
 
         # Limit the number of PromoCampaigns a Link can have
         # Note that the front end should prevent the user from getting
         # this far
-        existing_campaigns = list(PromoCampaign._by_link(l._id))
+        existing_campaigns = list(PromoCampaign._by_link(link._id))
         if len(existing_campaigns) > g.MAX_CAMPAIGNS_PER_LINK:
             c.errors.add(errors.TOO_MANY_CAMPAIGNS,
                          msg_params={'count': g.MAX_CAMPAIGNS_PER_LINK},
@@ -471,39 +598,34 @@ class PromoteController(ListingController):
             form.has_errors('title', errors.TOO_MANY_CAMPAIGNS)
             return
 
-        duration = max((end - start).days, 1)
-
-        if form.has_errors('bid', errors.BAD_BID):
-            return
-
-        # minimum bid depends on user privilege and targeting, checked here
-        # instead of in the validator b/c current duration is needed
-        if c.user_is_sponsor:
-            min_daily_bid = 0
-        elif targeting == 'one':
-            min_daily_bid = g.min_promote_bid * 1.5
-        else:
-            min_daily_bid = g.min_promote_bid
-
+        campaign = None
         if campaign_id36:
-            # you cannot edit the bid of a live ad unless it's a freebie
             try:
                 campaign = PromoCampaign._byID36(campaign_id36)
-                if (bid != campaign.bid and
-                    campaign.start_date < datetime.now(g.tz)
-                    and not campaign.is_freebie()):
-                    c.errors.add(errors.BID_LIVE, field='bid')
-                    form.has_errors('bid', errors.BID_LIVE)
-                    return
             except NotFound:
                 pass
 
-        if bid is None or bid / duration < min_daily_bid:
-            c.errors.add(errors.BAD_BID, field='bid',
-                         msg_params={'min': min_daily_bid,
-                                       'max': g.max_promote_bid})
-            form.has_errors('bid', errors.BAD_BID)
-            return
+        if priority.cpm:
+            if form.has_errors('bid', errors.BAD_BID):
+                return
+
+            # you cannot edit the bid of a live ad unless it's a freebie
+            if (campaign and bid != campaign.bid and
+                campaign.start_date < datetime.now(g.tz) and
+                not campaign.is_freebie()):
+                c.errors.add(errors.BID_LIVE, field='bid')
+                form.has_errors('bid', errors.BID_LIVE)
+                return
+
+            min_bid = 0 if c.user_is_sponsor else g.min_promote_bid
+            if bid is None or bid < min_bid:
+                c.errors.add(errors.BAD_BID, field='bid',
+                             msg_params={'min': min_bid,
+                                         'max': g.max_promote_bid})
+                form.has_errors('bid', errors.BAD_BID)
+                return
+        else:
+            bid = 0.   # Set bid to 0 as dummy value
 
         if targeting == 'one':
             if form.has_errors('sr', errors.SUBREDDIT_NOEXIST,
@@ -512,28 +634,38 @@ class PromoteController(ListingController):
                 # checking to get the error set in the form, but we can't
                 # check for rate-limiting if there's no subreddit
                 return
-            oversold = promote.is_roadblocked(sr.name, start, end)
-            if oversold and not c.user_is_sponsor:
-                msg_params = {"start": oversold[0].strftime('%m/%d/%Y'),
-                              "end": oversold[1].strftime('%m/%d/%Y')}
+
+            roadblock = PromotedLinkRoadblock.is_roadblocked(sr, start, end)
+            if roadblock and not c.user_is_sponsor:
+                msg_params = {"start": roadblock[0].strftime('%m/%d/%Y'),
+                              "end": roadblock[1].strftime('%m/%d/%Y')}
                 c.errors.add(errors.OVERSOLD, field='sr',
                              msg_params=msg_params)
                 form.has_errors('sr', errors.OVERSOLD)
                 return
-        if targeting == 'none':
+
+        elif targeting == 'none':
             sr = None
 
-        if campaign_id36 is not None:
-            campaign = PromoCampaign._byID36(campaign_id36)
-            promote.edit_campaign(l, campaign, dates, bid, sr)
-            r = promote.get_renderable_campaigns(l, campaign)
+        # Check inventory
+        campaign = campaign if campaign_id36 else None
+        if (not priority.inventory_override and
+            has_oversold_error(form, campaign, start, end, bid, cpm, sr)):
+            return
+
+        if campaign:
+            promote.edit_campaign(link, campaign, dates, bid, cpm, sr, priority)
+            r = promote.get_renderable_campaigns(link, campaign)
             jquery.update_campaign(r.campaign_id36, r.start_date, r.end_date,
-                                   r.duration, r.bid, r.sr, r.status)
+                                   r.duration, r.bid, r.spent, r.cpm, r.sr,
+                                   r.priority_name, r.inventory_override,
+                                   r.status)
         else:
-            campaign = promote.new_campaign(l, dates, bid, sr)
-            r = promote.get_renderable_campaigns(l, campaign)
+            campaign = promote.new_campaign(link, dates, bid, cpm, sr, priority)
+            r = promote.get_renderable_campaigns(link, campaign)
             jquery.new_campaign(r.campaign_id36, r.start_date, r.end_date,
-                                r.duration, r.bid, r.sr, r.status)
+                                r.duration, r.bid, r.spent, r.cpm, r.sr,
+                                r.priority_name, r.inventory_override, r.status)
 
     @validatedForm(VSponsor('link_id'),
                    VModhash(),
@@ -558,8 +690,8 @@ class PromoteController(ListingController):
             form.set_inputs(name="")
             form.set_html(".status:first", _("added"))
             if promote.add_traffic_viewer(thing, user):
-                user_row = TrafficViewerList(thing).user_row('traffic', user)
-                jquery("#traffic-table").show(
+                user_row = TrafficViewerList(thing).user_row('traffic_viewer', user)
+                jquery(".traffic_viewer-table").show(
                     ).find("table").insert_table_rows(user_row)
 
                 # send the user a message
@@ -592,12 +724,15 @@ class PromoteController(ListingController):
                    edit=VBoolean("edit"),
                    address=ValidAddress(
                     ["firstName", "lastName", "company", "address",
-                     "city", "state", "zip", "country", "phoneNumber"],
-                    allowed_countries=g.allowed_pay_countries),
+                     "city", "state", "zip", "country", "phoneNumber"]),
                    creditcard=ValidCard(["cardNumber", "expirationDate",
                                            "cardCode"]))
     def POST_update_pay(self, form, jquery, link, campaign, customer_id, pay_id,
                         edit, address, creditcard):
+        # Check inventory
+        if campaign_has_oversold_error(form, campaign):
+            return
+
         address_modified = not pay_id or edit
         form_has_errors = False
         if address_modified:
@@ -659,14 +794,15 @@ class PromoteController(ListingController):
 
     @validate(VSponsor("link_id"),
               link=VByName('link_id'),
-              file=VLength('file', 500 * 1024))
-    def POST_link_thumb(self, link=None, file=None):
+              file=VUploadLength('file', 500*1024),
+              img_type=VImageType('img_type'))
+    def POST_link_thumb(self, link=None, file=None, img_type='jpg'):
         if link and (not promote.is_promoted(link) or
                      c.user_is_sponsor or c.user.trusted_sponsor):
             errors = dict(BAD_CSS_NAME="", IMAGE_ERROR="")
             try:
                 # thumnails for promoted links can change and therefore expire
-                force_thumbnail(link, file, file_type=".jpg")
+                force_thumbnail(link, file, file_type=".%s" % img_type)
             except cssfilter.BadImage:
                 # if the image doesn't clean up nicely, abort
                 errors["IMAGE_ERROR"] = _("bad image")
@@ -679,14 +815,42 @@ class PromoteController(ListingController):
                                      errors=errors,
                                      form_id="image-upload").render()
 
-    @validate(VSponsorAdmin(),
-              launchdate=VDate('ondate'),
-              dates=VDateRange(['startdate', 'enddate']),
-              query_type=VOneOf('q', ('started_on', 'between'), default=None))
-    def GET_admin(self, launchdate=None, dates=None, query_type=None):
-        return PromoAdminTool(query_type=query_type,
-                              launchdate=launchdate,
-                              start=dates[0],
-                              end=dates[1]).render()
+    @validate(VSponsorAdminOrAdminSecret('secret'),
+              start=VDate('startdate'),
+              end=VDate('enddate'),
+              link_text=nop('link_text'),
+              owner=VAccountByName('owner'))
+    def GET_report(self, start, end, link_text=None, owner=None):
+        now = datetime.now(g.tz).replace(hour=0, minute=0, second=0,
+                                         microsecond=0)
+        end = end or now - timedelta(days=1)
+        start = start or end - timedelta(days=7)
 
+        links = []
+        bad_links = []
+        owner_name = owner.name if owner else ''
 
+        if owner:
+            promo_weights = PromotionWeights.get_campaigns(start, end,
+                                                           author_id=owner._id)
+            campaign_ids = [pw.promo_idx for pw in promo_weights]
+            campaigns = PromoCampaign._byID(campaign_ids, data=True)
+            link_ids = {camp.link_id for camp in campaigns.itervalues()}
+            links.extend(Link._byID(link_ids, data=True, return_dict=False))
+
+        if link_text is not None:
+            id36s = link_text.replace(',', ' ').split()
+            try:
+                links_from_text = Link._byID36(id36s, data=True)
+            except NotFound:
+                links_from_text = {}
+
+            bad_links = [id36 for id36 in id36s if id36 not in links_from_text]
+            links.extend(links_from_text.values())
+
+        content = PromoteReport(links, link_text, owner_name, bad_links, start,
+                                end)
+        if c.render_style == 'csv':
+            return content.as_csv()
+        else:
+            return PromotePage('report', content=content).render()

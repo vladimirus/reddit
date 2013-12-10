@@ -70,22 +70,17 @@ class LinkButtons(PrintableButtons):
         is_author = (c.user_is_loggedin and thing.author and
                      c.user.name == thing.author.name)
         # do we show the report button?
-        show_report = (not is_author and
-                       report and
-                       getattr(thing, "promoted", None) is None)
+        show_report = not is_author and report
 
         if c.user_is_admin and thing.promoted is None:
             show_report = False
 
-        if (thing.can_ban or is_author) and not thing.nsfw:
-            show_marknsfw = True
-        else:
-            show_marknsfw = False
-
-        if (thing.can_ban or is_author) and thing.nsfw and not thing.nsfw_str:
-            show_unmarknsfw = True
-        else:
-            show_unmarknsfw = False
+        show_marknsfw = show_unmarknsfw = False
+        if thing.can_ban or is_author or (thing.promoted and c.user_is_sponsor):
+            if not thing.nsfw:
+                show_marknsfw = True
+            elif thing.nsfw and not thing.nsfw_str:
+                show_unmarknsfw = True
 
         # do we show the delete button?
         show_delete = is_author and delete and not thing._deleted
@@ -96,7 +91,10 @@ class LinkButtons(PrintableButtons):
         # do we show the distinguish button? among other things,
         # we never want it to appear on link listings -- only
         # comments pages
-        show_distinguish = (is_author and (thing.can_ban or c.user_special_distinguish)
+        show_distinguish = (is_author and
+                            (thing.can_ban or  # Moderator distinguish
+                             c.user.employee or  # Admin distinguish
+                             c.user_special_distinguish)
                             and getattr(thing, "expand_children", False))
 
         kw = {}
@@ -159,7 +157,10 @@ class CommentButtons(PrintableButtons):
             and thing.subreddit.allow_comment_gilding
         )
 
-        show_distinguish = is_author and (thing.can_ban or c.user_special_distinguish)
+        show_distinguish = (is_author and
+                            (thing.can_ban or  # Moderator distinguish
+                             c.user.employee or  # Admin distinguish
+                             c.user_special_distinguish))
 
         PrintableButtons.__init__(self, "commentbuttons", thing,
                                   is_author = is_author, 
@@ -169,6 +170,7 @@ class CommentButtons(PrintableButtons):
                                   ignore_reports = thing.ignore_reports,
                                   new_window = c.user.pref_newwindow,
                                   full_comment_path = thing.full_comment_path,
+                                  full_comment_count = thing.full_comment_count,
                                   deleted = thing.deleted,
                                   parent_permalink = thing.parent_permalink, 
                                   can_reply = thing.can_reply,
@@ -217,17 +219,23 @@ def default_thing_wrapper(**params):
 # TODO: move this into lib somewhere?
 def wrap_links(links, wrapper = default_thing_wrapper(),
                listing_cls = LinkListing, 
-               num = None, show_nums = False, nextprev = False,
-               num_margin = None, mid_margin = None, **kw):
+               num = None, show_nums = False, nextprev = False, **kw):
     links = tup(links)
     if not all(isinstance(x, basestring) for x in links):
         links = [x._fullname for x in links]
     b = IDBuilder(links, num = num, wrap = wrapper, **kw)
     l = listing_cls(b, nextprev = nextprev, show_nums = show_nums)
-    if num_margin is not None:
-        l.num_margin = num_margin
-    if mid_margin is not None:
-        l.mid_margin = mid_margin
     return l.listing()
 
 
+def wrap_things(*things):
+    """Instantiate Wrapped for each thing, calling add_props if available."""
+    if not things:
+        return []
+
+    wrapped = [Wrapped(thing) for thing in things]
+    if hasattr(things[0], 'add_props'):
+        # assume all things are of the same type and use the first thing's
+        # add_props to process the list.
+        things[0].add_props(c.user, wrapped)
+    return wrapped

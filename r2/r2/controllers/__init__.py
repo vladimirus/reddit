@@ -54,7 +54,6 @@ def load_controllers():
 
     from listingcontroller import MyredditsController
 
-    from feedback import FeedbackController
     from front import FormsController
     from front import FrontController
     from health import HealthController
@@ -69,6 +68,8 @@ def load_controllers():
     from promotecontroller import PromoteController
     from mediaembed import MediaembedController
     from mediaembed import AdController
+    from policies import PoliciesController
+    from web import WebLogController
     
     from wiki import WikiController
     from wiki import WikiApiController
@@ -77,6 +78,7 @@ def load_controllers():
     from api import ApiminimalController
     from api_docs import ApidocsController
     from apiv1 import APIv1Controller
+    from multi import MultiApiController
     from oauth2 import OAuth2FrontendController
     from oauth2 import OAuth2AccessController
     from redirect import RedirectController

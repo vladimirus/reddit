@@ -53,10 +53,6 @@
     %else:
       <p>${_("Please select a payment method.")}</p>
 
-      %if thing.google_id:
-        ${self.google_button()}
-      %endif
-
       %if thing.paypal_buttonid:
         ${self.paypal_button()}
       %endif
@@ -74,10 +70,6 @@
       %endif
 
       <div class="throbber"></div>
-
-      %if not thing.google_id:
-        <div class="note">${_("Note: Google Checkout does not support ongoing subscriptions at this time.")}</div>
-      %endif
     %endif
     </div>
   </div>
@@ -92,34 +84,6 @@
     <button class="btn gold-button">${_("give")}</button>
     <span class="status"></span>
     <div class="throbber"></div>
-  </form>
-</%def>
-
-<%def name="google_button()">
-  <form action="https://checkout.google.com/api/checkout/v2/checkoutForm/Merchant/${thing.google_id}"
-        id="BB_BuyButtonForm" method="post" name="BB_BuyButtonForm"
-        class="gold-checkout google-checkout"
-        data-vendor="google-checkout"
-        target="${'_blank' if thing.clone_template else '_top'}">
-    <input name="item_name_1" type="hidden" value="creddits">
-    <input name="item_description_1" type="hidden"
-           %if thing.months != thing.quantity:
-             value="${thing.quantity} year(s) of reddit gold"
-           %else:
-             value="${thing.quantity} month(s) of reddit gold"
-           %endif
-           >
-    <input name="item_quantity_1" type="hidden"
-           value="${thing.quantity}">
-    <input name="item_price_1" type="hidden"
-           value="${thing.unit_price.decimal}">
-    <input type="hidden"
-           name="shopping-cart.items.item-1.merchant-private-item-data"
-           value="${thing.passthrough}" class="passthrough">
-    <input name="item_currency_1" type="hidden" value="USD">
-    <input name="_charset_" type="hidden" value="utf-8">
-    <input type="hidden" name="analyticsdata" value="">
-    <button class="btn gold-button">${_("Google Checkout")}</button>
   </form>
 </%def>
 
@@ -141,15 +105,12 @@
   <button class="btn stripe-gold gold-button">${_('Credit Card')}</button>
 </%def>
 
-<%def name="stripe_form(display=False)">
+<%def name="base_stripe_form()">
   <script type="text/javascript" src="https://js.stripe.com/v1/"></script>
 
-  <form action="/api/stripecharge/gold" method="POST"
-        id="stripe-payment"
+  <div id="base-stripe-form"
         class="gold-checkout"
-        data-vendor="stripe"
-        ${not display and "style='display:none'" or ''}>
-    <hr>
+        data-vendor="stripe">
     <div class="stripe-note">
       <a class="icon" href="https://stripe.com/help/security">powered by stripe</a>
       <div>${_('Stripe is PCI compliant and your credit card information is sent directly to them.')}</div>
@@ -215,12 +176,37 @@
     </table>
     <input type="hidden" name="stripePublicKey" value="${thing.stripe_key}">
     <input type="hidden" name="stripeToken" value="">
-    <input type="hidden" name="pennies" value="${thing.price.pennies}">
-    <input type="hidden" name="months" value="${thing.months}">
-    <input type="hidden" name="passthrough" value="${thing.passthrough}">
     <button class="btn gold-button stripe-submit">${_('Submit')}</button>
     <span class="status"></span>
-  </form>
+  </div>
+</%def>
+
+<%def name="stripe_form(display=False)">
+<div id="stripe-payment"
+     class="charge"
+     ${not display and "style='display:none'" or ''}>
+  <hr>
+  <table class="credit-card-input">
+    <tr> 
+      <th><label>${_('amount')}</label></th>
+      <th class="credit-card-amount">${thing.price}</th>
+    </tr>
+    %if thing.period:
+    <tr>
+      <th><label>${_('renewal interval')}</label></th>
+      <th class="credit-card-interval">${_(thing.period)}</th>
+    </tr>
+    %endif
+  </table>
+
+  <input type="hidden" name="pennies" value="${thing.price.pennies}">
+  <input type="hidden" name="months" value="${thing.months}">
+  <input type="hidden" name="period" value="${thing.period}">
+  <input type="hidden" name="passthrough" value="${thing.passthrough}">
+
+  <hr>
+  ${base_stripe_form()}
+</div>
 </%def>
 
 <%def name="coinbase_button()">

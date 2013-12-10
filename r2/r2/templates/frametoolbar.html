@@ -21,7 +21,7 @@
 ###############################################################################
 
 <%! 
-   from r2.lib.template_helpers import static, get_domain, add_sr, panel_size
+   from r2.lib.template_helpers import static, get_domain, add_sr
    from r2.lib.strings import Score
 %>
 
@@ -33,7 +33,10 @@
 <%def name="javascript_run()">
   ${parent.javascript_run()}
   reddit.external_frame = true;
-  toolbar = new toolbar_p("${panel_size('expanded')}", "${panel_size('collapsed')}");
+  toolbar = new toolbar_p();
+</%def>
+
+<%def name="sr_stylesheets()">
 </%def>
 
 <%def name="bodyContent()">
@@ -170,7 +173,7 @@
          title="${_('vote %(direction)s') % dict(direction=direction)}"
        %if thing.user_is_loggedin:
          href="javascript:void(0);"
-         onclick="$(this).vote('${thing.votehash}', null, event)"
+         onclick="$(this).vote(r.config.vote_hash, null, event)"
        %else:
          href="${thing.loginurl}"
          target="_top"

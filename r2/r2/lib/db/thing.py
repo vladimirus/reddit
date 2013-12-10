@@ -286,13 +286,12 @@ class DataThing(object):
                         del self._dirties[k]
             else:
                 self._dirties.clear()
-
-            self._cache_myself()
         except:
             rollback()
             raise
         else:
             commit()
+            self._cache_myself()
         finally:
             if lock:
                 lock.release()
@@ -382,7 +381,7 @@ class DataThing(object):
     #TODO error when something isn't found?
     @classmethod
     def _byID(cls, ids, data=False, return_dict=True, extra_props=None,
-              stale=False):
+              stale=False, ignore_missing=False):
         ids, single = tup(ids, True)
         prefix = thing_prefix(cls.__name__)
 
@@ -407,17 +406,20 @@ class DataThing(object):
         bases = sgm(cache, ids, items_db, prefix, stale=stale,
                     found_fn=count_found)
 
-        #check to see if we found everything we asked for
+        # Check to see if we found everything we asked for
+        missing = []
         for i in ids:
             if i not in bases:
-                missing = [i for i in ids if i not in bases]
-                raise NotFound, '%s %s' % (cls.__name__, missing)
-            if bases[i] and bases[i]._id != i:
+                missing.append(i)
+            elif bases[i] and bases[i]._id != i:
                 g.log.error("thing.py: Doppleganger on byID: %s got %s for %s" %
                             (cls.__name__, bases[i]._id, i))
                 bases[i] = items_db([i]).values()[0]
                 bases[i]._cache_myself()
-
+        if missing and not ignore_missing:
+            raise NotFound, '%s %s' % (cls.__name__, missing)
+        for i in missing:
+            ids.remove(i)
 
         if data:
             need = []
@@ -440,7 +442,7 @@ class DataThing(object):
                     bases[_id].__setattr__(k, v, False)
 
         if single:
-            return bases[ids[0]]
+            return bases[ids[0]] if ids else None
         elif return_dict:
             return bases
         else:
@@ -455,17 +457,19 @@ class DataThing(object):
         ids = [ int(x, 36) for x in id36s ]
 
         things = cls._byID(ids, return_dict=True, **kw)
+        things = {thing._id36: thing for thing in things.itervalues()}
 
         if single:
             return things.values()[0]
         elif return_dict:
             return things
         else:
-            return things.values()
+            return filter(None, (things.get(i) for i in id36s))
 
     @classmethod
     def _by_fullname(cls, names,
                      return_dict = True, 
+                     ignore_missing=False,
                      **kw):
         names, single = tup(names, True)
 
@@ -480,18 +484,20 @@ class DataThing(object):
                     type_dict = thing_types
                 elif real_type[0] == 'r':
                     type_dict = rel_types
+                else:
+                    raise NotFound
                 real_type = type_dict[int(real_type[1:], 36)]
                 thing_id = int(thing_id, 36)
                 lookup[fullname] = (real_type, thing_id)
                 table.setdefault(real_type, []).append(thing_id)
-            except ValueError:
+            except (KeyError, ValueError):
                 if single:
                     raise NotFound
 
         # lookup ids for each type
         identified = {}
         for real_type, thing_ids in table.iteritems():
-            i = real_type._byID(thing_ids, **kw)
+            i = real_type._byID(thing_ids, ignore_missing=ignore_missing, **kw)
             identified[real_type] = i
 
         # interleave types in original order of the name
@@ -499,11 +505,13 @@ class DataThing(object):
         for fullname in names:
             if lookup.has_key(fullname):
                 real_type, thing_id = lookup[fullname]
-                res.append((fullname,
-                            identified.get(real_type, {}).get(thing_id)))
+                thing = identified.get(real_type, {}).get(thing_id)
+                if not thing and ignore_missing:
+                    continue
+                res.append((fullname, thing))
 
         if single:
-            return res[0][1]
+            return res[0][1] if res else None
         elif return_dict:
             return dict(res)
         else:

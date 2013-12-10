@@ -20,7 +20,7 @@
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
-<%namespace file="utils.html" import="plain_link, pretty_button" />
+<%namespace file="utils.html" import="plain_link, pretty_button, data" />
 
 <%!
    from r2.lib.strings import strings
@@ -99,7 +99,7 @@
          ${distinguish_setter('no')}
          &#32;
 
-         %if c.user_is_admin:
+         %if c.user.employee:
          /&#32;
          ${distinguish_setter('admin')}
          &#32;
@@ -122,33 +122,33 @@
   %endif
 </%def>
 
-<%def name="ignore_reports_toggle(pressed)">
-  ${pretty_button(_("ignore reports"), "big_mod_toggle", "'ignore_reports', 'unignore_reports'", "neutral" + (" pressed" if pressed else ""))}
+<%def name="ignore_reports_toggle(thing)">
+  <%
+    label = _("ignore reports")
+    if thing.ignore_reports and thing.reported > 0:
+      label += " ({0})".format(thing.reported)
+  %>
+  ${pretty_button(label, "big_mod_toggle", "'ignore_reports', 'unignore_reports'", "neutral" + (" pressed" if thing.ignore_reports else ""))}
 </%def>
 
-<%def name="big_modbuttons(thing, kind)">
+<%def name="big_modbuttons(thing)">
   <span class="big-mod-buttons">
     <span role="radiogroup">
-      %if getattr(thing, "moderator_banned", None):
-        <!-- pass -->
-      %elif thing._spam:
-        ${pretty_button(_("confirm spam"), "big_mod_action", -2, "negative")}
-        ${pretty_button(_("remove ham"), "big_mod_action", -1, "neutral")}
-      %else:
+      %if not getattr(thing, "moderator_banned", None):
         ${pretty_button(_("spam"), "big_mod_action", -2, "negative")}
         ${pretty_button(_("remove"), "big_mod_action", -1, "neutral")}
       %endif
   
       %if getattr(thing, "approval_checkmark", None):
-        ${pretty_button(_("reapprove %(obj)s") % dict(obj=kind),
-        "big_mod_action",  1, "positive")}
+        ${pretty_button(_("reapprove"), "big_mod_action",  1, "positive")}
       %else:
-        ${pretty_button(_("approve %(obj)s") % dict(obj=kind),
-        "big_mod_action",  1, "positive")}
+        ${pretty_button(_("approve"), "big_mod_action",  1, "positive")}
       %endif
     </span>
 
-    ${ignore_reports_toggle(pressed=thing.ignore_reports)}
+    %if not thing._spam:
+      ${ignore_reports_toggle(thing)}
+    %endif
 
     &#32;
     <span class="status-msg spammed">
@@ -248,44 +248,39 @@
   %endif
 
   %if getattr(thing.thing, "use_big_modbuttons", False):
-     ${big_modbuttons(thing.thing, "link")}
+     ${big_modbuttons(thing.thing)}
   %elif thing.ignore_reports and thing.can_ban:
-    ${ignore_reports_toggle(pressed=True)}
+    ${ignore_reports_toggle(thing.thing)}
   %endif
 </%def>
 
 <%def name="commentbuttons()">
-  <li class="first">
-    ${self.bylink_button(_("permalink"), thing.permalink)}
-  </li>
-  %if thing.saved:
-    <li class="comment-unsave-button">
-       ${self.state_button("unsave", _("unsave"), "toggle_save(this)", _("save"))}
-    </li>
-  %else:
-    <li class="comment-save-button">
-       ${self.state_button("save", _("save"), "toggle_save(this)", _("unsave"))}
-    </li>
-  %endif
-  %if c.profilepage:
-    <li>
-      ${self.bylink_button(_("context"), thing.permalink + "?context=3")}
-    </li>
+  %if not thing.deleted:
     <li class="first">
-    ${self.comment_button("comment", _("full comments"), 
-                          thing.full_comment_path,
-                          _sr_path = True, 
-                          a_class = None, 
-                          newwindow = thing.new_window)}
+      ${self.bylink_button(_("permalink"), thing.permalink)}
     </li>
-  %endif
-  %if thing.deleted:
-    %if thing.parent_permalink and not thing.profilepage:
-      <li>
-        ${self.bylink_button(_("parent"), thing.parent_permalink)}
+    %if thing.saved:
+      <li class="comment-unsave-button">
+         ${self.state_button("unsave", _("unsave"), "toggle_save(this)", _("save"))}
+      </li>
+    %else:
+      <li class="comment-save-button">
+         ${self.state_button("save", _("save"), "toggle_save(this)", _("unsave"))}
       </li>
     %endif
-  %else:
+    %if c.profilepage:
+      <li>
+        ${self.bylink_button(_("context"), thing.permalink + "?context=3")}
+      </li>
+      <li class="first">
+      ${self.comment_button("comment",
+                            _("full comments") + " (%d)" % thing.full_comment_count, 
+                            thing.full_comment_path,
+                            _sr_path = True, 
+                            a_class = None, 
+                            newwindow = thing.new_window)}
+      </li>
+    %endif
     %if not thing.profilepage:
       %if thing.parent_permalink:
         <li>
@@ -319,9 +314,9 @@
      </li>
     %endif
     %if getattr(thing.thing, "use_big_modbuttons", False):
-       ${big_modbuttons(thing.thing, "comment")}
+       ${big_modbuttons(thing.thing)}
     %elif thing.ignore_reports and thing.can_ban:
-      ${ignore_reports_toggle(pressed=True)}
+      ${ignore_reports_toggle(thing.thing)}
     %endif
   %endif
 </%def>
@@ -339,7 +334,7 @@
   %endif
   %if thing.recipient:
     ${self.banbuttons()}
-      %if not thing.was_comment and thing.thing.author_id != c.user._id and thing.thing.author_id not in c.user.enemies:
+      %if (not thing.was_comment or thing.thing.message_style == "mention") and thing.thing.author_id != c.user._id and thing.thing.author_id not in c.user.enemies:
         <li>
           ${ynbutton(_("block user"), _("blocked"), "block", "hide_thing")}
         </li>
@@ -457,7 +452,7 @@
                     css_class = '', alt_css_class = '',
                     reverse = False,
                     login_required = False,
-                    style = '', )">
+                    style = '', data_attrs=None)">
 <%
    if reverse:
        callback, cancelback = cancelback, callback
@@ -465,7 +460,7 @@
        css_class, alt_css_class = alt_css_class, css_class
    extra_class = "login-required" if login_required else ""
  %>
-<span class="${class_name} toggle" style="${style}">
+<span class="${class_name} toggle" style="${style}" ${data(**data_attrs or dict())}>
  <a class="option active ${css_class} ${extra_class}" href="#" tabindex="100"
     %if not login_required or c.user_is_loggedin:
       onclick="return toggle(this, ${callback}, ${cancelback})"

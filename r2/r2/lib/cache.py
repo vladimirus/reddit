@@ -32,12 +32,14 @@ from pycassa import ColumnFamily
 from pycassa.cassandra.ttypes import ConsistencyLevel
 from pycassa.cassandra.ttypes import NotFoundException as CassandraNotFound
 
-from r2.lib.contrib import memcache
 from r2.lib.utils import in_chunks, prefix_keys, trace
 from r2.lib.hardcachebackend import HardCacheBackend
 
 from r2.lib.sgm import sgm # get this into our namespace so that it's
                            # importable from us
+
+# This is for use in the health controller
+_CACHE_SERVERS = set()
 
 class NoneResult(object): pass
 
@@ -60,42 +62,13 @@ class CacheUtils(object):
     def get_multi(self, keys, prefix='', **kw):
         return prefix_keys(keys, prefix, lambda k: self.simple_get_multi(k, **kw))
 
-class PyMemcache(CacheUtils, memcache.Client):
-    """We still use our patched python-memcache to talk to the
-       permacaches for legacy reasons"""
-    simple_get_multi = memcache.Client.get_multi
-
-    def __init__(self, servers):
-        memcache.Client.__init__(self, servers, pickleProtocol = 1)
-
-    def set_multi(self, keys, prefix='', time=0):
-        new_keys = {}
-        for k,v in keys.iteritems():
-            new_keys[str(k)] = v
-        memcache.Client.set_multi(self, new_keys, key_prefix = prefix,
-                                  time = time)
-
-    def get(self, key, default=None):
-        r = memcache.Client.get(self, key)
-        if r is None: return default
-        return r
-
-    def set(self, key, val, time=0):
-        memcache.Client.set(self, key, val, time = time)
-
-    def delete(self, key, time=0):
-        memcache.Client.delete(self, key, time=time)
-
-    def delete_multi(self, keys, prefix='', time=0):
-        memcache.Client.delete_multi(self, keys, time = time,
-                                     key_prefix = prefix)
-
 class CMemcache(CacheUtils):
     def __init__(self,
                  servers,
                  debug = False,
                  noreply = False,
                  no_block = False,
+                 min_compress_len=512 * 1024,
                  num_clients = 10):
         self.servers = servers
         self.clients = pylibmc.ClientPool(n_slots = num_clients)
@@ -111,7 +84,9 @@ class CMemcache(CacheUtils):
             client.behaviors.update(behaviors)
             self.clients.put(client)
 
-        self.min_compress_len = 512*1024
+        self.min_compress_len = min_compress_len
+
+        _CACHE_SERVERS.update(servers)
 
     def get(self, key, default = None):
         with self.clients.reserve() as mc:
@@ -732,7 +707,7 @@ class CassandraCache(CacheUtils):
                 if val != NoneResult:
                     ret[key] = self.cf.insert('%s%s' % (prefix, key),
                                               {'value': pickle.dumps(val)},
-                                              ttl = time)
+                                              ttl = time or None)
 
         self._warm(keys.keys())
 

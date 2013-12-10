@@ -24,6 +24,7 @@ from account import *
 from link import *
 from vote import *
 from report import *
+from subreddit import DefaultSR, AllSR, Frontpage
 from pylons import i18n, request, g
 
 from r2.lib.wrapped import Wrapped
@@ -39,7 +40,7 @@ class Listing(object):
     _js_cls = "Listing"
 
     def __init__(self, builder, nextprev = True, next_link = True,
-                 prev_link = True, vote_hash_type = 'valid', **kw):
+                 prev_link = True, **kw):
         self.builder = builder
         self.nextprev = nextprev
         self.next_link = True
@@ -47,7 +48,6 @@ class Listing(object):
         self.next = None
         self.prev = None
         self._max_num = 1
-        self.vote_hash_type = vote_hash_type
 
     @property
     def max_score(self):
@@ -69,26 +69,32 @@ class Listing(object):
                 item.render_replaced = True
         return builder_items
 
-    def listing(self):
+    def listing(self, next_suggestions=None):
         self.things, prev, next, bcount, acount = self.get_items()
 
+        self.next_suggestions = next_suggestions
         self._max_num = max(acount, bcount)
         self.after = None
         self.before = None
 
         if self.nextprev and self.prev_link and prev and bcount > 1:
-            p = request.get.copy()
+            p = request.GET.copy()
             p.update({'after':None, 'before':prev._fullname, 'count':bcount})
             self.before = prev._fullname
             self.prev = (request.path + utils.query_string(p))
-            p_first = request.get.copy()
+            p_first = request.GET.copy()
             p_first.update({'after':None, 'before':None, 'count':None})
             self.first = (request.path + utils.query_string(p_first))
         if self.nextprev and self.next_link and next:
-            p = request.get.copy()
+            p = request.GET.copy()
             p.update({'after':next._fullname, 'before':None, 'count':acount})
             self.after = next._fullname
             self.next = (request.path + utils.query_string(p))
+
+        for count, thing in enumerate(self.things):
+            thing.rowstyle = getattr(thing, 'rowstyle', "")
+            thing.rowstyle += ' ' + ('even' if (count % 2) else 'odd')
+
         #TODO: need name for template -- must be better way
         return Wrapped(self)
 
@@ -133,50 +139,20 @@ class SpotlightListing(Listing):
     _js_cls = "OrganicListing"
 
     def __init__(self, *a, **kw):
-        self.vote_hash_type = kw.get('vote_hash_type', 'organic')
         self.nextprev   = False
         self.show_nums  = True
         self._parent_max_num   = kw.get('max_num', 0)
         self._parent_max_score = kw.get('max_score', 0)
+        self.compress_display = c.user_is_loggedin and c.user.pref_compress
         self.interestbar = kw.get('interestbar')
         self.interestbar_prob = kw.get('interestbar_prob', 0.)
-        self.promotion_prob = kw.get('promotion_prob', 0.5)
-
-        promoted_links = kw.get('promoted_links', [])
-        organic_links = kw.get('organic_links', [])
-        predetermined_winner = kw.get('predetermined_winner', False)
-
-        self.links = []
-        for l in organic_links:
-            self.links.append(
-                SpotlightTuple(
-                    link=l._fullname,
-                    is_promo=False,
-                    campaign=None,
-                    weight=None,
-                )
-            )
-
-        total = sum(float(l.weight) for l in promoted_links)
-        for i, l in enumerate(promoted_links):
-            link = l._fullname if isinstance(l, Wrapped) else l.link
-            if predetermined_winner:
-                weight = 1 if i == 0 else 0
-            else:
-                weight = l.weight / total
-            self.links.append(
-                SpotlightTuple(
-                    link=link,
-                    is_promo=True,
-                    campaign=l.campaign,
-                    weight=weight,
-                )
-            )
-
-        self.things = organic_links
-        self.things.extend(l for l in promoted_links
-                           if isinstance(l, Wrapped))
-
+        self.show_promo = kw.get('show_promo', False)
+        srnames = kw.get('srnames', [])
+        self.srnames = '+'.join([srname if srname else Frontpage.name
+                                 for srname in srnames])
+        self.navigable = kw.get('navigable', True)
+        self.things = kw.get('organic_links', [])
+        self.show_placeholder = isinstance(c.site, (DefaultSR, AllSR))
 
     def get_items(self):
         from r2.lib.template_helpers import replace_render

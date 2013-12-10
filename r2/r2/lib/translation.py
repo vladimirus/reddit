@@ -22,7 +22,16 @@
 
 import json
 import os
+import token
+import tokenize
+
+from babel.messages.extract import extract_javascript
+from cStringIO import StringIO
+
+import babel.messages.frontend
+import babel.messages.pofile
 import pylons
+
 from pylons.i18n.translation import translation, LanguageError, NullTranslations
 
 try:
@@ -31,6 +40,10 @@ except ImportError:
     I18N_PATH = ''
 else:
     I18N_PATH = os.path.dirname(reddit_i18n.__file__)
+
+# Different from the default lang (as defined in the ini file)
+# Source language is what is in the source code
+SOURCE_LANG = 'en'
 
 
 def _get_translator(lang, graceful_fail=False, **kwargs):
@@ -82,7 +95,9 @@ def load_data(lang_path, domain=None, extension='data'):
 
 def iter_langs(base_path=I18N_PATH):
     if base_path:
-        for lang in os.listdir(base_path):
+        # sorted() so that get_active_langs can check completion
+        # data on "base" languages of a dialect
+        for lang in sorted(os.listdir(base_path)):
             full_path = os.path.join(base_path, lang, 'LC_MESSAGES')
             if os.path.isdir(full_path):
                 yield lang, full_path
@@ -91,12 +106,23 @@ def iter_langs(base_path=I18N_PATH):
 def get_active_langs(path=I18N_PATH, default_lang='en'):
     trans = []
     trans_name = {}
+    completions = {}
     for lang, lang_path in iter_langs(path):
         data = load_data(lang_path)
         name = [data['name'], '']
         if data['_is_enabled'] and lang != default_lang:
             trans.append(lang)
             completion = float(data['num_completed']) / float(data['num_total'])
+            completions[lang] = completion
+            # This relies on iter_langs hitting the base_lang first
+            base_lang, is_dialect, dialect = lang.partition("-")
+            if is_dialect:
+                if base_lang == SOURCE_LANG:
+                    # Source language has to be 100% complete
+                    base_completion = 1.0
+                else:
+                    base_completion = completions.get(base_lang, 0)
+                completion = max(completion, base_completion)
             if completion < .5:
                 name[1] = ' (*)'
         trans_name[lang] = name
@@ -106,3 +132,64 @@ def get_active_langs(path=I18N_PATH, default_lang='en'):
     if default_lang not in trans_name:
         trans_name[default_lang] = default_lang
     return trans, trans_name
+
+
+def get_catalog(lang):
+    """Return a Catalog object given the language code."""
+    path = os.path.join(I18N_PATH, lang, "LC_MESSAGES", "r2.po")
+    with open(path, "r") as f:
+        return babel.messages.pofile.read_po(f)
+
+
+class extract_messages(babel.messages.frontend.extract_messages):
+    """Extract messages from all specified directories.
+
+    This is a work around for a bug in Babel which causes the --input-dirs
+    parameter to extract_messages to not work properly.
+
+    The bug has been fixed in babel, but no releases have been made since the
+    fix. This class will do the trick until that time and should be safe once
+    the fix is released.
+
+    http://babel.edgewall.org/ticket/232
+
+    """
+
+    def finalize_options(self):
+        if self.input_dirs:
+            self.input_dirs = self.input_dirs.split(",")
+
+        babel.messages.frontend.extract_messages.finalize_options(self)
+
+
+def validate_plural_forms(plural_forms_str):
+    """Ensure the gettext plural forms expression supplied is valid."""
+
+    # this code is taken from the python stdlib; gettext.py:c2py
+    tokens = tokenize.generate_tokens(StringIO(plural_forms_str).readline)
+
+    try:
+        danger = [x for x in tokens if x[0] == token.NAME and x[1] != 'n']
+    except tokenize.TokenError:
+        raise ValueError, \
+              'plural forms expression error, maybe unbalanced parenthesis'
+    else:
+        if danger:
+            raise ValueError, 'plural forms expression could be dangerous'
+
+
+def extract_javascript_msgids(source):
+    """Return message ids of translateable strings in JS source."""
+
+    extracted = extract_javascript(
+        fileobj=StringIO(source),
+        keywords={
+            "_": None,
+            "P_": (1, 2),
+            "N_": None,
+        },
+        comment_tags={},
+        options={},
+    )
+
+    return [msg_id for line, func, msg_id, comments in extracted]

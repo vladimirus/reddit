@@ -20,6 +20,8 @@
 # Inc. All Rights Reserved.
 ###############################################################################
 
+from sqlalchemy.orm.exc import MultipleResultsFound
+
 from pylons import g
 
 from r2.lib.db.thing import NotFound
@@ -38,6 +40,7 @@ from r2.lib.authorize.api import (
     Order,
     ProfileTransAuthOnly,
     ProfileTransPriorAuthCapture,
+    ProfileTransRefund,
     ProfileTransVoid,
     UpdateCustomerPaymentProfileRequest,
 )
@@ -184,7 +187,14 @@ def void_transaction(user, trans_id, campaign, test=None):
 @export
 def is_charged_transaction(trans_id, campaign):
     if not trans_id: return False # trans_id == 0 means no bid
-    bid =  Bid.one(transaction=trans_id, campaign=campaign)
+    try:
+        bid = Bid.one(transaction=trans_id, campaign=campaign)
+    except NotFound:
+        return False
+    except MultipleResultsFound:
+        g.log.error('Multiple bids for trans_id %s' % trans_id)
+        return False
+
     return bid.is_charged()
 
 
@@ -205,3 +215,22 @@ def charge_transaction(user, trans_id, campaign, test=None):
 
     # already charged
     return True
+
+
+@export
+def refund_transaction(user, trans_id, campaign_id, amount, test=None):
+    # refund will only work if charge has settled
+    bid =  Bid.one(transaction=trans_id, campaign=campaign_id)
+    if trans_id < 0:
+        bid.refund(amount)
+        return True
+    else:
+        success, res = _make_transaction(ProfileTransRefund, amount, user,
+                                         bid.pay_id, trans_id=trans_id,
+                                         test=test)
+        if success:
+            bid.refund(amount)
+        elif success == False:
+            msg = "Refund failed, response: %r" % res
+            raise AuthorizeNetException(msg)
+        return True

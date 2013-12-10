@@ -41,11 +41,11 @@ from r2.lib.filters import _force_unicode
 from copy import deepcopy
 from r2.lib.utils import Storage
 
-from r2.models.wiki import WIKI_RECENT_DAYS
+from r2.models import wiki
 
 from collections import defaultdict
 import time
-from admintools import compute_votes, admintools, ip_span
+from admintools import compute_votes, admintools, ip_span, is_banned_domain
 
 EXTRA_FACTOR = 1.5
 MAX_RECURSION = 10
@@ -71,16 +71,17 @@ class Builder(object):
         #get authors
         #TODO pull the author stuff into add_props for links and
         #comments and messages?
-
         aids = set(l.author_id for l in items if hasattr(l, 'author_id')
                    and l.author_id is not None)
 
         authors = {}
-        cup_infos = {}
+        cakes = {}
         friend_rels = None
         if aids:
             authors = Account._byID(aids, data=True, stale=self.stale) if aids else {}
-            cup_infos = Account.cup_info_multi(aids)
+            now = datetime.datetime.now(g.tz)
+            cakes = {a._id for a in authors.itervalues()
+                     if a.cake_expiration and a.cake_expiration >= now}
             if user and user.gold:
                 friend_rels = user.friend_rels()
 
@@ -108,7 +109,6 @@ class Builder(object):
 
         types = {}
         wrapped = []
-        count = 0
 
         modlink = {}
         modlabel = {}
@@ -138,7 +138,8 @@ class Builder(object):
             if hasattr(item, "distinguished"):
                 if item.distinguished == 'yes':
                     w.distinguished = 'moderator'
-                elif item.distinguished in ('admin', 'special'):
+                elif item.distinguished in ('admin', 'special',
+                                            'gold', 'gold-auto'):
                     w.distinguished = item.distinguished
 
             try:
@@ -174,13 +175,14 @@ class Builder(object):
                     args['kind'] = 'special'
                 add_attr(w.attribs, **args)
 
-            if w.author and w.author._id in cup_infos and not c.profilepage:
-                cup_info = cup_infos[w.author._id]
-                label = _(cup_info["label_template"]) % \
-                        {'user':w.author.name}
-                add_attr(w.attribs, 'trophy:' + cup_info["img_url"],
-                         label=label,
-                         link = "/user/%s" % w.author.name)
+            if w.author and w.author._id in cakes and not c.profilepage:
+                add_attr(
+                    w.attribs,
+                    kind="cake",
+                    label=(_("%(user)s just celebrated a reddit birthday!") %
+                           {"user": w.author.name}),
+                    link="/user/%s" % w.author.name,
+                )
 
             if hasattr(item, "sr_id") and item.sr_id is not None:
                 w.subreddit = subreddits[item.sr_id]
@@ -213,11 +215,6 @@ class Builder(object):
                 if getattr(item, "verdict", None):
                     if not item.verdict.endswith("-approved"):
                         w.link_notes.append(w.verdict)
-
-            w.rowstyle = getattr(w, 'rowstyle', "")
-            w.rowstyle += ' ' + ('even' if (count % 2) else 'odd')
-
-            count += 1
 
             if c.user_is_admin and getattr(item, 'ip', None):
                 w.ip_span = ip_span(item.ip)
@@ -270,6 +267,27 @@ class Builder(object):
                          or (w.author and w.author._id == user._id
                              and item.sr_id in can_own_flair_set)))):
                 w.can_flair = True
+
+            w.approval_checkmark = None
+            if w.can_ban:
+                verdict = getattr(w, "verdict", None)
+                if verdict in ('admin-approved', 'mod-approved'):
+                    approver = None
+                    approval_time = None
+                    baninfo = getattr(w, "ban_info", None)
+                    if baninfo:
+                        approver = baninfo.get("unbanner", None)
+                        approval_time = baninfo.get("unbanned_at", None)
+
+                    approver = approver or _("a moderator")
+
+                    if approval_time:
+                        text = _("approved by %(who)s %(when)s ago") % {
+                                    "who": approver,
+                                    "when": timesince(approval_time)}
+                    else:
+                        text = _("approved by %s") % approver
+                    w.approval_checkmark = text
 
         # recache the user object: it may be None if user is not logged in,
         # whereas now we are happy to have the UnloggedUser object
@@ -595,6 +613,11 @@ class SearchBuilder(IDBuilder):
 class WikiRevisionBuilder(QueryBuilder):
     show_extended = True
     
+    def __init__(self, *k, **kw):
+        self.user = kw.pop('user', None)
+        self.sr = kw.pop('sr', None)
+        QueryBuilder.__init__(self, *k, **kw)
+    
     def wrap_items(self, items):
         types = {}
         wrapped = []
@@ -611,13 +634,15 @@ class WikiRevisionBuilder(QueryBuilder):
         return wrapped
     
     def keep_item(self, item):
-        return not item.is_hidden
+        from r2.lib.validator.wiki import may_view
+        return ((not item.is_hidden) and
+                may_view(self.sr, self.user, item.wikipage))
 
 class WikiRecentRevisionBuilder(WikiRevisionBuilder):
     show_extended = False
     
     def must_skip(self, item):
-        return (datetime.datetime.now(g.tz) - item.date).days >= WIKI_RECENT_DAYS
+        return (datetime.datetime.now(g.tz) - item.date).days >= wiki.WIKI_RECENT_DAYS
         
 
 def empty_listing(*things):

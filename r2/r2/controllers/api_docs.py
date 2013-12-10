@@ -66,17 +66,23 @@ section_info = {
     'subreddits': {
         'title': _('subreddits'),
     },
+    'multis': {
+        'title': _('multis'),
+    },
     'users': {
         'title': _('users'),
     },
     'wiki': {
         'title': _('wiki'),
+    },
+    'captcha': {
+        'title': _('captcha'),
     }
 }
 
 api_section = Storage((k, k) for k in section_info)
 
-def api_doc(section, **kwargs):
+def api_doc(section, uses_site=False, **kwargs):
     """
     Add documentation annotations to the decorated function.
 
@@ -87,6 +93,7 @@ def api_doc(section, **kwargs):
         if 'extends' in kwargs:
             kwargs['extends'] = kwargs['extends']._api_doc
         doc.update(kwargs)
+        doc['uses_site'] = uses_site
         doc['section'] = section
         doc['lineno'] = api_function.func_code.co_firstlineno
 
@@ -122,8 +129,9 @@ class ApidocsController(RedditController):
             if not action:
                 continue
 
+            valid_methods = ('GET', 'POST', 'PUT', 'DELETE')
             api_doc = getattr(func, '_api_doc', None)
-            if api_doc and 'section' in api_doc and method in ('GET', 'POST'):
+            if api_doc and 'section' in api_doc and method in valid_methods:
                 docs = {}
                 docs['doc'] = inspect.getdoc(func)
 
@@ -133,6 +141,14 @@ class ApidocsController(RedditController):
                     docs['parameters'] = {}
                 docs.update(api_doc)
 
+                # append a message to the docstring if supplied
+                notes = docs.get("notes")
+                if notes:
+                    if docs["doc"]:
+                        docs["doc"] += "\n\n" + notes
+                    else:
+                        docs["doc"] = notes
+
                 uri = docs.get('uri') or '/'.join((url_prefix, action))
                 if 'extensions' in docs:
                     # if only one extension was specified, add it to the URI.
@@ -140,6 +156,9 @@ class ApidocsController(RedditController):
                         uri += '.' + docs['extensions'][0]
                         del docs['extensions']
                 docs['uri'] = uri
+
+                if api_doc['uses_site']:
+                    docs["in-subreddit"] = True
 
                 oauth_perms = getattr(func, 'oauth2_perms', {})
                 docs['oauth_scopes'] = oauth_perms.get('allowed_scopes', [])
@@ -165,8 +184,10 @@ class ApidocsController(RedditController):
         # controllers to gather docs from.
         from r2.controllers.api import ApiController, ApiminimalController
         from r2.controllers.apiv1 import APIv1Controller
+        from r2.controllers.captcha import CaptchaController
         from r2.controllers.front import FrontController
         from r2.controllers.wiki import WikiApiController
+        from r2.controllers.multi import MultiApiController
         from r2.controllers import listingcontroller
 
         api_controllers = [
@@ -174,6 +195,8 @@ class ApidocsController(RedditController):
             (ApiController, '/api'),
             (ApiminimalController, '/api'),
             (WikiApiController, '/api/wiki'),
+            (MultiApiController, '/api/multi'),
+            (CaptchaController, ''),
             (FrontController, '')
         ]
         for name, value in vars(listingcontroller).iteritems():

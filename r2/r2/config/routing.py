@@ -28,7 +28,20 @@ from pylons import config
 
 
 def not_in_sr(environ, results):
-    return 'subreddit' not in environ and 'sub_domain' not in environ
+    return ('subreddit' not in environ and
+            'sub_domain' not in environ and
+            'domain' not in environ)
+
+
+# FIXME: submappers with path prefixes are broken in Routes 1.11. Once we
+# upgrade, we should be able to replace this ugliness with submappers.
+def partial_connect(mc, **override_args):
+    def connect(path, **kwargs):
+        if 'path_prefix' in override_args:
+            path = override_args['path_prefix'] + path
+        kwargs.update(override_args)
+        mc(path, **kwargs)
+    return connect
 
 
 def make_map():
@@ -50,8 +63,6 @@ def make_map():
 
     mc('/over18', controller='post', action='over18')
 
-    mc('/search', controller='front', action='search')
-
     mc('/rules', controller='front', action='rules')
     mc('/sup', controller='front', action='sup')
     mc('/traffic', controller='front', action='site_traffic')
@@ -59,14 +70,9 @@ def make_map():
        action='lang_traffic', langcode='')
     mc('/traffic/adverts/:code', controller='front',
        action='advert_traffic', code='')
+    mc('/traffic/subreddits/report', controller='front',
+       action='subreddit_traffic_report')
     mc('/account-activity', controller='front', action='account_activity')
-
-    mc('/about/message/:where', controller='message', action='listing')
-    mc('/about/log', controller='front', action='moderationlog')
-    mc('/about/sidebar', controller='front', action='sidebar')
-    mc('/about', controller='front', action='about')
-    mc('/about/:location', controller='front', action='editreddit',
-       location='about')
 
     mc('/subreddits/create', controller='front', action='newreddit')
     mc('/subreddits/search', controller='front', action='search_reddits')
@@ -107,8 +113,10 @@ def make_map():
 
     mc('/i18n', controller='redirect', action='redirect',
        dest='http://www.reddit.com/r/i18n')
-    mc('/feedback', controller='feedback', action='feedback')
-    mc('/ad_inq', controller='feedback', action='ad_inq')
+    mc('/feedback', controller='redirect', action='redirect',
+       dest='/contact')
+    mc('/contact', controller='front', action='contact_us')
+    mc('/ad_inq', controller='front', action='ad_inq')
 
     mc('/admin/awards', controller='awards')
     mc('/admin/awards/:awardcn/:action', controller='awards',
@@ -120,7 +128,45 @@ def make_map():
        where='overview')
     mc('/user/:username/:where', controller='user', action='listing',
        where='overview')
+
+    multi_prefixes = (
+       partial_connect(mc, path_prefix='/user/:username/m/:multipath'),
+       partial_connect(mc, path_prefix='/me/m/:multipath', my_multi=True),
+    )
+
+    for connect in multi_prefixes:
+       connect('/', controller='hot', action='listing')
+       connect('/submit', controller='front', action='submit')
+       connect('/:sort', controller='browse', sort='top',
+          action='listing', requirements=dict(sort='top|controversial'))
+       connect('/:controller', action='listing',
+          requirements=dict(controller="hot|new|rising|randomrising"))
+
+    mc('/user/:username/:where/:show', controller='user', action='listing')
+    
+    mc('/explore', controller='front', action='explore')
+    mc('/api/recommend/feedback', controller='api', action='rec_feedback')
+
+    mc('/about/sidebar', controller='front', action='sidebar')
+    mc('/about/sticky', controller='front', action='sticky')
+    mc('/about/flair', controller='front', action='flairlisting')
+    mc('/about', controller='front', action='about')
+    for connect in (mc,) + multi_prefixes:
+       connect('/about/message/:where', controller='message',
+          action='listing')
+       connect('/about/log', controller='front', action='moderationlog')
+       connect('/about/:location', controller='front',
+          action='spamlisting',
+          requirements=dict(location='reports|spam|modqueue|unmoderated'))
+       connect('/about/:location', controller='front', action='editreddit',
+          location='about')
+       connect('/comments', controller='comments', action='listing')
+       connect('/comments/gilded', action='listing', controller='gilded')
+       connect('/gilded', action='listing', controller='gilded')
+       connect('/search', controller='front', action='search')
+
     mc('/u/:username', controller='redirect', action='user_redirect')
+    mc('/u/:username/*rest', controller='redirect', action='user_redirect')
 
     # preserve timereddit URLs from 4/1/2012
     mc('/t/:timereddit', controller='redirect', action='timereddit_redirect')
@@ -135,16 +181,13 @@ def make_map():
     mc('/info/:article/:dest/:comment', controller='front',
        action='oldinfo', type='old', dest='comments', comment=None)
 
-    mc("/comments/gilded", controller="redirect", action="gilded_comments",
-       conditions={"function": not_in_sr})
-    mc("/comments/gilded", action="listing", controller="gilded")
 
     mc('/related/:article/:title', controller='front',
        action='related', title=None)
     mc('/details/:article/:title', controller='front',
        action='details', title=None)
-    mc('/traffic/:article/:title', controller='front',
-       action='traffic', title=None)
+    mc('/traffic/:link/:campaign', controller='front', action='traffic',
+       campaign=None)
     mc('/comments/:article/:title/:comment', controller='front',
        action='comments', title=None, comment=None)
     mc('/duplicates/:article/:title', controller='front',
@@ -158,7 +201,6 @@ def make_map():
     mc('/framebuster/:what/:blah',
        controller='front', action='framebuster')
 
-    mc('/admin/promoted', controller='promote', action='admin')
     mc('/promoted/edit_promo/:link',
        controller='promote', action='edit_promo')
     mc('/promoted/edit_promo_cpm/:link',  # development only
@@ -167,26 +209,26 @@ def make_map():
        action='edit_promo_campaign')
     mc('/promoted/pay/:link/:campaign',
        controller='promote', action='pay')
-    mc('/promoted/graph',
-       controller='promote', action='graph')
-    mc('/promoted/admin/graph', controller='promote', action='admingraph')
-    mc('/promoted/inventory/:sr_name',
-       controller='promote', action='inventory')
-    mc('/promoted/traffic/headline/:link',
-       controller='front', action='promo_traffic')
+    mc('/promoted/refund/:link/:campaign', controller='promote',
+       action='refund')
+    mc('/promoted/inventory', controller='promote', action='promote_inventory')
 
     mc('/promoted/:action', controller='promote',
        requirements=dict(action="edit_promo|new_promo|roadblock"))
+    mc('/promoted/report', controller='promote', action='report')
+    mc('/promoted/:sort/:sr', controller='promote', action='listing',
+       requirements=dict(sort='live_promos'))
     mc('/promoted/:sort', controller='promote', action="listing")
     mc('/promoted/', controller='promoted', action="listing", sort="")
 
     mc('/health', controller='health', action='health')
     mc('/health/ads', controller='health', action='promohealth')
+    mc('/health/caches', controller='health', action='cachehealth')
 
     mc('/', controller='hot', action='listing')
 
     mc('/:controller', action='listing',
-       requirements=dict(controller="hot|new|rising|randomrising|comments"))
+       requirements=dict(controller="hot|new|rising|randomrising"))
     mc('/saved', controller='user', action='saved_redirect')
 
     mc('/by_id/:names', controller='byId', action='listing')
@@ -206,16 +248,20 @@ def make_map():
 
     mc('/gold', controller='forms', action="gold")
     mc('/gold/creditgild/:passthrough', controller='forms', action='creditgild')
-    mc('/gold/about', controller='front', action='gold_info')
     mc('/gold/thanks', controller='front', action='goldthanks')
+    mc('/gold/subscription', controller='forms', action='subscription')
 
     mc('/password', controller='forms', action="password")
     mc('/:action', controller='front',
-       requirements=dict(action="random|framebuster|selfserviceoatmeal"))
+       requirements=dict(action="random|framebuster"))
     mc('/:action', controller='embed',
        requirements=dict(action="blog"))
     mc('/help/gold', controller='redirect', action='redirect',
        dest='/gold/about')
+
+    mc('/help/:page', controller='policies', action='policy_page',
+       conditions={'function':not_in_sr},
+       requirements={'page':'privacypolicy|useragreement'})
 
     mc('/wiki/create/*page', controller='wiki', action='wiki_create')
     mc('/wiki/edit/*page', controller='wiki', action='wiki_revise')
@@ -267,10 +313,12 @@ def make_map():
 
     mc('/api', controller='redirect', action='redirect', dest='/dev/api')
     mc('/api/distinguish/:how', controller='api', action="distinguish")
-    # wherever this is, google has to agree.
-    mc('/api/gcheckout', controller='ipn', action='gcheckout')
     mc('/api/spendcreddits', controller='ipn', action="spendcreddits")
     mc('/api/stripecharge/gold', controller='stripe', action='goldcharge')
+    mc('/api/modify_subscription', controller='stripe',
+       action='modify_subscription')
+    mc('/api/cancel_subscription', controller='stripe',
+       action='cancel_subscription')
     mc('/api/stripewebhook/gold/:secret', controller='stripe',
        action='goldwebhook')
     mc('/api/coinbasewebhook/gold/:secret', controller='coinbase',
@@ -289,10 +337,27 @@ def make_map():
                                  "freebie|promote_note|update_pay|refund|"
                                  "traffic_viewer|rm_traffic_viewer|"
                                  "edit_campaign|delete_campaign|meta_promo|"
-                                 "add_roadblock|rm_roadblock")))
+                                 "add_roadblock|rm_roadblock|check_inventory|"
+                                 "refund_campaign")))
     mc('/api/:action', controller='apiminimal',
        requirements=dict(action="new_captcha"))
+    mc('/api/:type', controller='api',
+       requirements=dict(type='wikibannednote|bannednote'),
+       action='relnote')
     mc('/api/:action', controller='api')
+    
+    mc('/api/recommend/sr/:srnames', controller='api',
+       action='subreddit_recommendations')
+
+    mc('/api/server_seconds_visibility', controller='api',
+       action='server_seconds_visibility')
+
+    mc("/api/multi/mine", controller="multiapi", action="my_multis")
+    mc("/api/multi/copy", controller="multiapi", action="multi_copy")
+    mc("/api/multi/rename", controller="multiapi", action="multi_rename")
+    mc("/api/multi/*multipath/r/:srname", controller="multiapi", action="multi_subreddit")
+    mc("/api/multi/*multipath/description", controller="multiapi", action="multi_description")
+    mc("/api/multi/*multipath", controller="multiapi", action="multi")
 
     mc("/api/v1/:action", controller="oauth2frontend",
        requirements=dict(action="authorize"))
@@ -311,11 +376,6 @@ def make_map():
 
     mc('/mediaembed/:link', controller="mediaembed", action="mediaembed")
 
-    mc('/doquery', controller='query', action='doquery')
-
-    mc('/store', controller='redirect', action='redirect',
-       dest='http://store.reddit.com/index.html')
-
     mc('/code', controller='redirect', action='redirect',
        dest='http://github.com/reddit/')
 
@@ -331,6 +391,12 @@ def make_map():
     mc("/ads/", controller="ad", action="ad")
 
     mc("/try", controller="forms", action="try_compact")
+
+    mc("/web/log/:level", controller="weblog", action="message",
+       requirements=dict(level="error"))
+
+    # Obsolete content redirects
+    mc("/selfserviceoatmeal", controller="redirect", dest="/ad_inq")
 
     # This route handles displaying the error page and
     # graphics used in the 404/500

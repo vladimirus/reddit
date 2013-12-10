@@ -5,39 +5,94 @@ r.setup = function(config) {
     // Set the legacy config global
     reddit = config
 
-    _.each(['debug', 'warn', 'error'], function(name) {
-        // suppress debug messages unless config.debug is set
-        r[name] = (name != 'debug' || config.debug)
-                && window.console && console[name]
-                ? _.bind(console[name], console)
-                : function() {}
-    })
+    r.logging.init()
 
     r.config.currentOrigin = location.protocol+'//'+location.host
     r.analytics.breadcrumbs.init()
 }
 
-r.setupBackbone = function() {
-    Backbone.ajax = function(request) {
-        var preloaded = r.preload.read(request.url)
+r.ajax = function(request) {
+    var url = request.url
+
+    if (request.type == 'GET') {
+        var preloaded = r.preload.read(url)
         if (preloaded != null) {
             request.success(preloaded)
-            return
-        }
 
-        return Backbone.$.ajax(request)
+            var deferred = new jQuery.Deferred
+            deferred.resolve(preloaded)
+            return deferred
+        }
+    }
+
+    var isLocal = url && (url[0] == '/' || url.lastIndexOf(r.config.currentOrigin, 0) == 0)
+    if (isLocal) {
+        if (!request.headers) {
+            request.headers = {}
+        }
+        request.headers['X-Modhash'] = r.config.modhash
+    }
+
+    return $.ajax(request)
+}
+
+store.safeGet = function(key, errorValue) {
+    if (store.disabled) {
+        return errorValue
+    }
+
+    // errorValue defaults to undefined, equivalent to the key being unset.
+    try {
+        return store.get(key)
+    } catch (err) {
+        r.sendError('Unable to read storage key "%(key)s" (%(err)s)'.format({
+            key: key,
+            err: err
+        }))
+        // TODO: reset value to errorValue?
+        return errorValue
     }
 }
 
-$(function() {
-    r.setupBackbone()
+store.safeSet = function(key, val) {
+    if (store.disabled) {
+        return false
+    }
 
-    r.login.ui.init()
-    r.analytics.init()
-    r.ui.init()
-    r.spotlight.init()
-    r.interestbar.init()
-    r.apps.init()
-    r.wiki.init()
-    r.gold.init()
+    // swallow exceptions upon storage set for non-trivial operations. returns
+    // a boolean value indicating success.
+    try {
+        store.set(key, val)
+        return true
+    } catch (err) {
+        r.warn('Unable to set storage key "%(key)s" (%(err)s)'.format({
+            key: key,
+            err: err
+        }))
+        return false
+    }
+}
+
+r.setupBackbone = function() {
+    Backbone.emulateJSON = true
+    Backbone.ajax = r.ajax
+}
+
+$(function() {
+    try {
+        r.setupBackbone()
+
+        r.login.ui.init()
+        r.analytics.init()
+        r.ui.init()
+        r.interestbar.init()
+        r.visited.init()
+        r.apps.init()
+        r.wiki.init()
+        r.gold.init()
+        r.multi.init()
+        r.recommend.init()
+    } catch (err) {
+        r.sendError('Error during base.js init', err)
+    }
 })

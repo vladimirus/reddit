@@ -21,7 +21,7 @@
 ###############################################################################
 
 <%!
-  from r2.lib.template_helpers import static
+  from r2.lib.template_helpers import static, media_https_if_secure
   from r2.lib.utils import timeuntil
 %>
 
@@ -32,7 +32,7 @@
 <%def name="icon(app)">
   <div class="app-icon">
     &nbsp;
-    <img src="${app.icon_url or static('defaultapp.png')}">
+    <img src="${media_https_if_secure(app.icon_url) or static('defaultapp.png')}">
     &nbsp;
   </div>
 </%def>
@@ -90,19 +90,15 @@
       ${developers(app)}
     %endif
     <div class="edit-app ${'collapsed' if collapsed else ''}">
-      <% from r2.lib import media %>
-      %if media.can_upload_icon():
-        <a class="edit-app-icon-button" href="javascript:void(0)">
-          change icon
-        </a>
-        <%utils:ajax_upload target="/api/setappicon"
-                            form_id="app-icon-upload-${app._id}">
-          <input type="hidden" name="client_id" value="${app._id}" />
-          ${error_field('NOT_SUPPORTED', '')}
-          ${error_field('TOO_LONG', 'file')}
-          ${error_field('BAD_IMAGE', 'file')}
-        </%utils:ajax_upload>
-      %endif
+      <a class="edit-app-icon-button" href="javascript:void(0)">
+        change icon
+      </a>
+      <%utils:ajax_upload target="/api/setappicon"
+                          form_id="app-icon-upload-${app._id}">
+        <input type="hidden" name="client_id" value="${app._id}" />
+        ${error_field('TOO_LONG', 'file')}
+        ${error_field('BAD_IMAGE', 'file')}
+      </%utils:ajax_upload>
       <div class="edit-app-form">
         <form method="post" action="/api/updateapp" class="pretty-form"
          id="update-app-${app._id}"

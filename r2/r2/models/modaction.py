@@ -21,6 +21,7 @@
 ###############################################################################
 
 from datetime import timedelta
+import itertools
 
 from r2.lib.db import tdb_cassandra
 from r2.lib.utils import tup
@@ -45,6 +46,7 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
     _read_consistency_level = tdb_cassandra.CL.ONE
     _use_db = True
     _connection_pool = 'main'
+    _ttl = timedelta(days=120)
     _str_props = ('sr_id36', 'mod_id36', 'target_fullname', 'action', 'details', 
                   'description')
     _defaults = {}
@@ -56,7 +58,8 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
                'editsettings', 'editflair', 'distinguish', 'marknsfw', 
                'wikibanned', 'wikicontributor', 'wikiunbanned',
                'removewikicontributor', 'wikirevise', 'wikipermlevel',
-               'ignorereports', 'unignorereports', 'setpermissions')
+               'ignorereports', 'unignorereports', 'setpermissions', 'sticky',
+               'unsticky')
 
     _menu = {'banuser': _('ban user'),
              'unbanuser': _('unban user'),
@@ -83,7 +86,10 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
              'wikipermlevel': _('wiki page permissions'),
              'ignorereports': _('ignore reports'),
              'unignorereports': _('unignore reports'),
-             'setpermissions': _('permissions')}
+             'setpermissions': _('permissions'),
+             'sticky': _('sticky post'),
+             'unsticky': _('unsticky post'),
+            }
 
     _text = {'banuser': _('banned'),
              'wikibanned': _('wiki banned'),
@@ -110,11 +116,14 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
              'marknsfw': _('marked nsfw'),
              'ignorereports': _('ignored reports'),
              'unignorereports': _('unignored reports'),
-             'setpermissions': _('changed permissions on')}
+             'setpermissions': _('changed permissions on'),
+             'sticky': _('stickied'),
+             'unsticky': _('unstickied'),
+            }
 
     _details_text = {# approve comment/link
                      'unspam': _('unspam'),
-                     'confirm_ham': _('confirmed ham'),
+                     'confirm_ham': _('approved'),
                      # remove comment/link
                      'confirm_spam': _('confirmed spam'),
                      'remove': _('removed not spam'),
@@ -130,9 +139,11 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
                      'link_type': _('link type'),
                      'submit_link_label': _('submit link button label'),
                      'submit_text_label': _('submit text post button label'),
+                     'comment_score_hide_mins': _('comment score hide period'),
                      'over_18': _('toggle viewers must be over 18'),
                      'allow_top': _('toggle allow in default set'),
                      'show_media': _('toggle show thumbnail images of content'),
+                     'public_traffic': _('toggle public traffic stats page'),
                      'exclude_banned_modqueue': _('toggle exclude banned users\' posts from modqueue'),
                      'domain': _('domain'),
                      'show_cname_sidebar': _('toggle show sidebar from cname'),
@@ -163,7 +174,7 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
                      'permission_moderator_invite': _('set permissions on moderator invitation')}
 
     # This stuff won't change
-    cache_ignore = set(['subreddit', 'target']).union(Printable.cache_ignore)
+    cache_ignore = set(['subreddit', 'target', 'mod', 'button']).union(Printable.cache_ignore)
 
     # Thing properties for Printable
     @property
@@ -221,7 +232,8 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
         Update all Views.
         """
 
-        views = (ModActionBySR, ModActionBySRMod, ModActionBySRAction)
+        views = (ModActionBySR, ModActionBySRMod, ModActionBySRAction, 
+                 ModActionBySRActionMod)
 
         for v in views:
             v.add_object(self)
@@ -245,14 +257,17 @@ class ModAction(tdb_cassandra.UuidThing, Printable):
         if not mod and not action:
             rowkeys = [sr._id36 for sr in srs]
             q = ModActionBySR.query(rowkeys, after=after, reverse=reverse, count=count)
-        elif mod and not action:
-            rowkeys = ['%s_%s' % (sr._id36, mod._id36) for sr in srs]
-            q = ModActionBySRMod.query(rowkeys, after=after, reverse=reverse, count=count)
-        elif not mod and action:
+        elif mod:
+            mods = tup(mod)
+            key = '%s_%s' if not action else '%%s_%%s_%s' % action
+            rowkeys = itertools.product([sr._id36 for sr in srs],
+                [mod._id36 for mod in mods])
+            rowkeys = [key % (sr, mod) for sr, mod in rowkeys]
+            view = ModActionBySRActionMod if action else ModActionBySRMod
+            q = view.query(rowkeys, after=after, reverse=reverse, count=count)
+        else:
             rowkeys = ['%s_%s' % (sr._id36, action) for sr in srs]
             q = ModActionBySRAction.query(rowkeys, after=after, reverse=reverse, count=count)
-        else:
-            raise NotImplementedError("Can't query by both mod and action")
 
         return q
 
@@ -377,6 +392,18 @@ class ModActionBySRMod(tdb_cassandra.View):
     @classmethod
     def _rowkey(cls, ma):
         return '%s_%s' % (ma.sr_id36, ma.mod_id36)
+
+class ModActionBySRActionMod(tdb_cassandra.View):
+    _use_db = True
+    _connection_pool = 'main'
+    _compare_with = TIME_UUID_TYPE
+    _view_of = ModAction
+    _ttl = timedelta(days=90)
+    _read_consistency_level = tdb_cassandra.CL.ONE
+
+    @classmethod
+    def _rowkey(cls, ma):
+        return '%s_%s_%s' % (ma.sr_id36, ma.mod_id36, ma.action)
 
 class ModActionBySRAction(tdb_cassandra.View):
     _use_db = True

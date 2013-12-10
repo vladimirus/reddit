@@ -23,6 +23,7 @@
 from __future__ import with_statement
 
 from r2.models import *
+from r2.models.wiki import ImagesByWikiPage
 from r2.lib.utils import sanitize_url, strip_www, randstr
 from r2.lib.strings import string_dict
 from r2.lib.pages.things import wrap_links
@@ -33,11 +34,8 @@ from mako import filters
 
 import os
 import tempfile
-from r2.lib import s3cp
 
 from r2.lib.media import upload_media
-
-from r2.lib.template_helpers import s3_https_if_secure
 
 import re
 from urlparse import urlparse
@@ -177,52 +175,34 @@ class ValidationError(Exception):
         obj = str(self.obj) if hasattr(self,'obj') else ''
         return "ValidationError%s: %s (%s)" % (line, self.message, obj)
 
-def legacy_s3_url(url, site):
-    if isinstance(url, int): # legacy url, needs to be generated
-        bucket = g.s3_old_thumb_bucket
-        baseurl = "http://%s" % (bucket)
-        if g.s3_media_direct:
-            baseurl = "http://%s/%s" % (s3_direct_url, bucket)
-        url = "%s/%s_%d.png"\
-                % (baseurl, site._fullname, url)
-    url = s3_https_if_secure(url)
-    return url
 
-# local urls should be in the static directory
-local_urls = re.compile(r'\A/static/[a-z./-]+\Z')
 # substitutable urls will be css-valid labels surrounded by "%%"
 custom_img_urls = re.compile(r'%%([a-zA-Z0-9\-]+)%%')
-valid_url_schemes = ('http', 'https')
-def valid_url(prop,value,report):
-    """
-    checks url(...) arguments in CSS, ensuring that the contents are
-    officially sanctioned.  Sanctioned urls include:
-     * anything in /static/
-     * image labels %%..%% for images uploaded on /about/stylesheet
-     * urls with domains in g.allowed_css_linked_domains
+def valid_url(prop, value, report, generate_https_urls):
+    """Validate a URL in the stylesheet.
+
+    The only valid URLs for use in a stylesheet are the custom image format
+    (%%example%%) which this function will translate to actual URLs.
+
     """
     try:
         url = value.getStringValue()
     except IndexError:
         g.log.error("Problem validating [%r]" % value)
         raise
-    # local urls are allowed
-    if local_urls.match(url):
-        t_url = None
-        while url != t_url:
-            t_url, url = url, filters.url_unescape(url)
-        # disallow path trickery
-        if "../" in url:
-            report.append(ValidationError(msgs['broken_url']
-                                          % dict(brokenurl = value.cssText),
-                                          value))
-    # custom urls are allowed, but need to be transformed into a real path
-    elif custom_img_urls.match(url):
-        name = custom_img_urls.match(url).group(1)
-        # the label -> image number lookup is stored on the subreddit
-        if c.site.images.has_key(name):
-            url = c.site.images[name]
-            url = legacy_s3_url(url, c.site)
+
+    m = custom_img_urls.match(url)
+    if m:
+        name = m.group(1)
+
+        # this relies on localcache to not be doing a lot of lookups
+        images = ImagesByWikiPage.get_images(c.site, "config/stylesheet")
+
+        if name in images:
+            if not generate_https_urls:
+                url = images[name]
+            else:
+                url = g.media_provider.convert_to_https(images[name])
             value._setCssText("url(%s)"%url)
         else:
             # unknown image label -> error
@@ -230,29 +210,14 @@ def valid_url(prop,value,report):
                                           % dict(brokenurl = value.cssText),
                                           value))
     else:
-        try:
-            u = urlparse(url)
-            valid_scheme = u.scheme and u.scheme in valid_url_schemes
-            valid_domain = u.netloc in g.allowed_css_linked_domains
-        except ValueError:
-            u = False
-
-        # allowed domains are ok
-        if not (u and valid_scheme and valid_domain):
-            report.append(ValidationError(msgs['broken_url']
-                                          % dict(brokenurl = value.cssText),
-                                          value))
-    #elif sanitize_url(url) != url:
-    #    report.append(ValidationError(msgs['broken_url']
-    #                                  % dict(brokenurl = value.cssText),
-    #                                  value))
+        report.append(ValidationError(msgs["custom_images_only"], value))
 
 
 def strip_browser_prefix(prop):
     t = prefix_regex.split(prop, maxsplit=1)
     return t[len(t) - 1]
 
-def valid_value(prop,value,report):
+def valid_value(prop, value, report, generate_https_urls):
     prop_name = strip_browser_prefix(prop.name) # Remove browser-specific prefixes eg: -moz-border-radius becomes border-radius
     if not (value.valid and value.wellformed):
         if (value.wellformed
@@ -287,11 +252,16 @@ def valid_value(prop,value,report):
             report.append(ValidationError(error,value))
 
     if value.primitiveType == CSSPrimitiveValue.CSS_URI:
-        valid_url(prop,value,report)
+        valid_url(
+            prop,
+            value,
+            report,
+            generate_https_urls,
+        )
 
 error_message_extract_re = re.compile('.*\\[([0-9]+):[0-9]*:.*\\]\Z')
 only_whitespace          = re.compile('\A\s*\Z')
-def validate_css(string):
+def validate_css(string, generate_https_urls):
     p = CSSParser(raiseExceptions = True)
 
     if not string or only_whitespace.match(string):
@@ -337,13 +307,23 @@ def validate_css(string):
 
                 if prop.cssValue.cssValueType == CSSValue.CSS_VALUE_LIST:
                     for i in range(prop.cssValue.length):
-                        valid_value(prop,prop.cssValue.item(i),report)
+                        valid_value(
+                            prop,
+                            prop.cssValue.item(i),
+                            report,
+                            generate_https_urls,
+                        )
                     if not (prop.cssValue.valid and prop.cssValue.wellformed):
                         report.append(ValidationError(msgs['invalid_property_list']
                                                       % dict(proplist = prop.cssText),
                                                       prop.cssValue))
                 elif prop.cssValue.cssValueType == CSSValue.CSS_PRIMITIVE_VALUE:
-                    valid_value(prop,prop.cssValue,report)
+                    valid_value(
+                        prop,
+                        prop.cssValue,
+                        report,
+                        generate_https_urls,
+                    )
 
                 # cssutils bug: because valid values might be marked
                 # as invalid, we can't trust cssutils to properly
@@ -365,12 +345,12 @@ def validate_css(string):
                                           % dict(ruletype = rule.cssText),
                                           rule))
 
-    return parsed,report
+    return parsed.cssText if parsed else "", report
 
 def find_preview_comments(sr):
     from r2.lib.db.queries import get_sr_comments, get_all_comments
 
-    comments = get_sr_comments(c.site)
+    comments = get_sr_comments(sr)
     comments = list(comments)
     if not comments:
         comments = get_all_comments()
@@ -379,12 +359,12 @@ def find_preview_comments(sr):
     return Thing._by_fullname(comments[:25], data=True, return_dict=False)
 
 def find_preview_links(sr):
-    from r2.lib.normalized_hot import get_hot
+    from r2.lib.normalized_hot import normalized_hot
 
     # try to find a link to use, otherwise give up and return
-    links = get_hot([c.site])
+    links = normalized_hot([sr._id])
     if not links:
-        links = get_hot(Subreddit.default_subreddits(ids=False))
+        links = normalized_hot(Subreddit.default_subreddits())
 
     if links:
         links = links[:25]
@@ -392,11 +372,13 @@ def find_preview_links(sr):
 
     return links
 
-def rendered_link(links, media, compress):
+def rendered_link(links, media, compress, stickied=False):
     with c.user.safe_set_attr:
         c.user.pref_compress = compress
         c.user.pref_media    = media
     links = wrap_links(links, show_nums = True, num = 1)
+    for wrapped in links:
+        wrapped.stickied = stickied
     delattr(c.user, 'pref_compress')
     delattr(c.user, 'pref_media') 
     return links.render(style = "html")

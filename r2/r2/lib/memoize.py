@@ -22,13 +22,13 @@
 
 from hashlib import md5
 
-from r2.config import cache
 from r2.lib.filters import _force_utf8
 from r2.lib.cache import NoneResult, make_key
 from r2.lib.lock import make_lock_factory
 from pylons import g
 
 make_lock = g.make_lock
+memoizecache = g.memoizecache
 
 def memoize(iden, time = 0, stale=False, timeout=30):
     def memoize_fn(fn):
@@ -41,7 +41,7 @@ def memoize(iden, time = 0, stale=False, timeout=30):
 
             key = make_key(iden, *a, **kw)
 
-            res = None if update else cache.get(key, stale=stale)
+            res = None if update else memoizecache.get(key, stale=stale)
 
             if res is None:
                 # not cached, we should calculate it.
@@ -50,7 +50,7 @@ def memoize(iden, time = 0, stale=False, timeout=30):
 
                     # see if it was completed while we were waiting
                     # for the lock
-                    stored = None if update else cache.get(key)
+                    stored = None if update else memoizecache.get(key)
                     if stored is not None:
                         # it was calculated while we were waiting
                         res = stored
@@ -59,13 +59,14 @@ def memoize(iden, time = 0, stale=False, timeout=30):
                         res = fn(*a, **kw)
                         if res is None:
                             res = NoneResult
-                        cache.set(key, res, time = time)
+                        memoizecache.set(key, res, time=time)
 
             if res == NoneResult:
                 res = None
 
             return res
 
+        new_fn.memoized_fn = fn
         return new_fn
     return memoize_fn
 

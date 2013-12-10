@@ -46,7 +46,7 @@ class Printable(object):
                         'downvotes', '_downs',
                         'subreddit_slow', '_deleted', '_spam',
                         'cachable', 'make_permalink', 'permalink',
-                        'timesince', 'votehash'
+                        'timesince',
                         ])
 
     @classmethod
@@ -57,7 +57,6 @@ class Printable(object):
             # caching of thing templates
             item.display = CachedVariable("display")
             item.timesince = CachedVariable("timesince")
-            item.votehash = CachedVariable("votehash")
             item.childlisting = CachedVariable("childlisting")
 
             score_fmt = getattr(item, "score_fmt", Score.number_only)
@@ -84,7 +83,7 @@ class Printable(object):
 
         if style == 'htmllite':
             s.extend([c.bgcolor, c.bordercolor, 
-                      request.get.has_key('style'),
-                      request.get.get("expanded"), 
+                      request.GET.has_key('style'),
+                      request.GET.get("expanded"),
                       getattr(wrapped, 'embed_voting_style', None)])
         return s

@@ -37,6 +37,7 @@ import datetime
 from pylons import g
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
+from sqlalchemy.orm.exc import NoResultFound
 from sqlalchemy.schema import Column
 from sqlalchemy.sql.expression import desc, distinct
 from sqlalchemy.sql.functions import sum as sa_sum
@@ -114,7 +115,14 @@ def zip_timeseries(*series, **kwargs):
     next_slice = (max if kwargs.get("order", "descending") == "descending"
                   else min)
     iterators = [PeekableIterator(s) for s in series]
-    widths = [len(w.peek() or []) for w in iterators]
+    widths = []
+    for w in iterators:
+        r = w.peek()
+        if r:
+            date, values = r
+            widths.append(len(values))
+        else:
+            widths.append(0)
 
     while True:
         items = [it.peek() for it in iterators]
@@ -237,7 +245,7 @@ def make_history_query(cls, interval):
     return time_points, q
 
 
-def top_last_month(cls, key):
+def top_last_month(cls, key, ids=None):
     """Aggregate a listing of the top items (by pageviews) last month.
 
     We use the last month because it's guaranteed to be fully computed and
@@ -251,8 +259,12 @@ def top_last_month(cls, key):
     q = (Session.query(cls)
                 .filter(cls.date == last_month)
                 .filter(cls.interval == "month")
-                .order_by(desc(cls.date), desc(cls.pageview_count))
-                .limit(55))
+                .order_by(desc(cls.date), desc(cls.pageview_count)))
+
+    if ids:
+        q = q.filter(getattr(cls, key).in_(ids))
+    else:
+        q = q.limit(55)
 
     return [(getattr(r, key), (r.unique_count, r.pageview_count))
             for r in q.all()]
@@ -315,23 +327,58 @@ def total_by_codename(cls, codenames):
 
 
 def promotion_history(cls, codename, start, stop):
-    """Get hourly traffic for a self-serve promotion across all campaigns."""
+    """Get hourly traffic for a self-serve promotion.
+
+    Traffic stats are summed over all targets for classes that include a target.
+
+    """
+
     time_points = get_time_points('hour', start, stop)
-    q = (Session.query(cls)
+    q = (Session.query(cls.date, sum(cls.pageview_count))
                 .filter(cls.interval == "hour")
                 .filter(cls.codename == codename)
                 .filter(cls.date.in_(time_points))
+                .group_by(cls.date)
                 .order_by(cls.date))
-    return [(r.date, (r.unique_count, r.pageview_count)) for r in q.all()]
+    return [(r[0], (r[1],)) for r in q.all()]
+
+
+def campaign_history(cls, codenames, start, stop):
+    """Get hourly traffic for given campaigns."""
+    time_points = get_time_points('hour', start, stop)
+    q = (Session.query(cls)
+                .filter(cls.interval == "hour")
+                .filter(cls.codename.in_(codenames))
+                .filter(cls.date.in_(time_points))
+                .order_by(cls.date))
+    return [(r.date, r.codename, r.subreddit, (r.unique_count,
+                                               r.pageview_count))
+            for r in q.all()]
 
 
 @memoize("traffic_last_modified", time=60 * 10)
 def get_traffic_last_modified():
     """Guess how far behind the traffic processing system is."""
-    return (Session.query(SitewidePageviews.date)
+    try:
+        return (Session.query(SitewidePageviews.date)
                    .order_by(desc(SitewidePageviews.date))
                    .limit(1)
                    .one()).date
+    except NoResultFound:
+        return datetime.datetime.min
+
+
+@memoize("missing_traffic", time=60 * 10)
+def get_missing_traffic(start, end):
+    """Check for missing hourly traffic between start and end."""
+
+    # NOTE: start, end must be UTC time without tzinfo
+    time_points = get_time_points('hour', start, end)
+    q = (Session.query(SitewidePageviews.date)
+                .filter(SitewidePageviews.interval == "hour")
+                .filter(SitewidePageviews.date.in_(time_points)))
+    found = [t for (t,) in q]
+    return [t for t in time_points if t not in found]
 
 
 class SitewidePageviews(Base):
@@ -371,8 +418,9 @@ class PageviewsBySubreddit(Base):
 
     @classmethod
     @memoize_traffic(time=3600 * 6)
-    def top_last_month(cls):
-        return top_last_month(cls, "subreddit")
+    def top_last_month(cls, srs=None):
+        ids = [sr.name for sr in srs] if srs else None
+        return top_last_month(cls, "subreddit", ids)
 
 
 class PageviewsBySubredditAndPath(Base):
@@ -466,8 +514,17 @@ class TargetedClickthroughsByCodename(Base):
 
     @classmethod
     @memoize_traffic(time=3600)
+    def promotion_history(cls, codename, start, stop):
+        return promotion_history(cls, codename, start, stop)
+
+    @classmethod
+    @memoize_traffic(time=3600)
     def total_by_codename(cls, codenames):
         return total_by_codename(cls, codenames)
+
+    @classmethod
+    def campaign_history(cls, codenames, start, stop):
+        return campaign_history(cls, codenames, start, stop)
 
 
 class AdImpressionsByCodename(Base):
@@ -538,8 +595,17 @@ class TargetedImpressionsByCodename(Base):
 
     @classmethod
     @memoize_traffic(time=3600)
+    def promotion_history(cls, codename, start, stop):
+        return promotion_history(cls, codename, start, stop)
+
+    @classmethod
+    @memoize_traffic(time=3600)
     def total_by_codename(cls, codenames):
         return total_by_codename(cls, codenames)
+
+    @classmethod
+    def campaign_history(cls, codenames, start, stop):
+        return campaign_history(cls, codenames, start, stop)
 
 
 class SubscriptionsBySubreddit(Base):

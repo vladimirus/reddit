@@ -106,9 +106,9 @@ function form_error(form) {
     return function(req) {
         var msg
         if (req == 'ratelimit') {
-            msg = r.strings('rate_limit')
+            msg = r._('please wait a few seconds and try again.')
         } else {
-            msg = r.strings('an_error_occurred', {status: req.status})
+            msg = r._('an error occurred (status: %(status)s)').format({status: req.status})
         }
         $(form).find('.status').text(msg)
     }
@@ -522,8 +522,6 @@ function updateEventHandlers(thing) {
     /* click on a title.. */
     $(thing).filter(".link")
         .find("a.title, a.comments").mousedown(function() {
-            /* mark as clicked */
-            $(this).addClass("click");
             /* set the click cookie. */
             add_thing_to_cookie(this, "recentclicks2");
         });
@@ -561,15 +559,10 @@ function last_click() {
 }
 
 function login(elem) {
-    if(cnameframe)
-        return true;
-
     return post_user(this, "login");
 };
 
 function register(elem) {
-    if(cnameframe)
-        return true;
     return post_user(this, "register");
 };
 
@@ -638,7 +631,7 @@ function sr_search(query) {
     query = query.toLowerCase();
     var cache = sr_cache();
     if (!cache[query]) {
-        $.request('search_reddit_names.json', {query: query},
+        $.request('search_reddit_names.json', {query: query, include_over_18: r.config.over_18},
                   function (r) {
                       cache[query] = r['names'];
                       update_dropdown(r['names']);
@@ -881,6 +874,25 @@ function save_usertext(elem) {
 
 function reply(elem) {
     var form = comment_reply_for_elem(elem);
+
+    // quote any selected text and put it in the textarea if it's empty
+    // not compatible with IE < 9
+    var textarea = form.find("textarea")
+    if (window.getSelection && textarea.val().length == 0) {
+        // check if the selection is all inside one markdown element
+        var sel = window.getSelection()
+        var focusParentDiv = $(sel.focusNode).parents(".md").first()
+        var anchorParentDiv = $(sel.anchorNode).parents(".md").first()
+        if (focusParentDiv.length && focusParentDiv.is(anchorParentDiv)) {
+            var selectedText = sel.toString()
+            if (selectedText.length > 0) {
+                selectedText = selectedText.replace(/^/gm, "> ")
+                textarea.val(selectedText+"\n\n")
+                textarea.scrollTop(textarea.scrollHeight)
+            }
+        }
+    }
+
     //show the right buttons
     show_edit_usertext(form);
     //re-show the whole form if required
@@ -954,11 +966,11 @@ var toolbar_p = function(expanded_size, collapsed_size) {
     };
     
     this.show_panel = function() {
-        parent.inner_toolbar.document.body.cols = expanded_size;
+        $('body', parent.inner_toolbar.document).addClass('expanded')
     };
         
     this.hide_panel = function() {
-        parent.inner_toolbar.document.body.cols = collapsed_size;
+        $('body', parent.inner_toolbar.document).removeClass('expanded')
     };
         
     this.resize_toolbar = function() {

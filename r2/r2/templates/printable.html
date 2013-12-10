@@ -21,7 +21,7 @@
 ###############################################################################
 
 <%! 
-   from r2.lib.template_helpers import add_sr
+   from r2.lib.template_helpers import add_sr, static
    from r2.lib.strings import strings
    from r2.lib.pages.things import BanButtons
 %>
@@ -45,7 +45,23 @@ ${self.RenderPrintable()}
   %endif
 </%def>
 
-<%def name="thing_css_class(what)">thing id-${what._fullname}</%def>
+<%def name="approval_checkmark()">
+  %if getattr(thing, "approval_checkmark", None):
+      <img class="approval-checkmark" title="${thing.approval_checkmark}"
+           src="${static('green-check.png')}"
+           onclick="alert('${thing.approval_checkmark}\n\n${_("(no need to click for this info; just hover over the checkmark next time)")}')"
+         >
+  %endif
+</%def>
+
+<%def name="thing_css_class(what)">
+  <%
+    cssclass = "thing"
+    if not getattr(what, 'deleted', False):
+      cssclass += " id-" + what._fullname
+  %>
+  ${cssclass}
+</%def>
 
 <%def name="thing_css_rowclass(what)">
   <%
@@ -57,7 +73,7 @@ ${self.RenderPrintable()}
       rowclass = what.rowstyle + " reported"
     else:
       rowclass = what.rowstyle
-    if hasattr(what, "_deleted") and what._deleted:
+    if getattr(what, "deleted", False):
       rowclass += " deleted"
     if hasattr(what, "saved") and what.saved:
       rowclass += " saved"
@@ -67,14 +83,26 @@ ${self.RenderPrintable()}
       rowclass += " gilded"
     if hasattr(what, "user_gilded") and what.user_gilded:
       rowclass += " user-gilded"
+    if getattr(what, "stickied", False):
+      rowclass += " stickied"
   %>
   ${rowclass}
 </%def>
 
 <%def name="thing_data_attributes(what)">
-    data-fullname="${what._fullname}"
+    % if not getattr(what, 'deleted', False):
+      data-fullname="${what._fullname}"
+    % endif
     % if hasattr(what, 'campaign'):
       data-cid="${what.campaign}"
+    % endif
+
+    % if hasattr(what, 'adserver_imp_pixel'):
+      data-adserver-imp-pixel="${what.adserver_imp_pixel}"
+    % endif
+
+    % if hasattr(what, 'adserver_click_url'):
+      data-adserver-click-url="${what.adserver_click_url}"
     % endif
 </%def>
 
@@ -87,7 +115,9 @@ ${self.RenderPrintable()}
       cls = thing.render_class.__name__.lower()
    else:
       cls = thing.lookups[0].__class__.__name__.lower()
-   
+
+   cls += ' ' + getattr(thing, 'extra_css_class', '')
+
    if getattr(thing, "is_self", False):
       selflink = "self"
    else:
@@ -144,7 +174,7 @@ ${self.RenderPrintable()}
 %>
   <div class="arrow ${_class} login-required"
        %if getattr(thing, "votable", True):
-         onclick="$(this).vote('${thing.votehash}', null, event)"
+         onclick="$(this).vote(r.config.vote_hash, null, event)"
        %else:
          onclick="$(this).show_unvotable_message()"
        %endif

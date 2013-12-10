@@ -25,8 +25,27 @@ import StringIO
 import r2.lib.captcha as captcha
 from pylons import c, response
 
+from r2.controllers.api_docs import api_doc, api_section
+
 class CaptchaController(RedditController):
+    @api_doc(api_section.captcha, uri='/captcha/{iden}')
     def GET_captchaimg(self, iden):
+        """
+        Request a CAPTCHA image given an `iden`.
+
+        An iden is given as the `captcha` field with a `BAD_CAPTCHA`
+        error, you should use this endpoint if you get a
+        `BAD_CAPTCHA` error response.
+
+        Responds with a 120x50 `image/png` which should be displayed
+        to the user.
+
+        The user's response to the CAPTCHA should be sent as `captcha`
+        along with your request.
+
+        To request a new CAPTCHA,
+        use [/api/new_captcha](#POST_api_new_captcha).
+        """
         image = captcha.get_image(iden)
         f = StringIO.StringIO()
         image.save(f, "PNG")

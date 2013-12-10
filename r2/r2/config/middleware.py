@@ -32,13 +32,13 @@ from paste.cascade import Cascade
 from paste.registry import RegistryManager
 from paste.urlparser import StaticURLParser
 from paste.deploy.converters import asbool
+from paste.request import path_info_split
 from pylons import config, response
 from pylons.middleware import ErrorDocuments, ErrorHandler
 from pylons.wsgiapp import PylonsApp
 from routes.middleware import RoutesMiddleware
 
 from r2.config.environment import load_environment
-from r2.config.rewrites import rewrites
 from r2.config.extensions import extension_mapping, set_extension
 from r2.lib.utils import is_subdomain
 
@@ -57,11 +57,22 @@ webob.util.status_reasons[429] = HTTPTooManyRequests.title
 
 #from pylons.middleware import error_mapper
 def error_mapper(code, message, environ, global_conf=None, **kw):
-    from pylons import c
     if environ.get('pylons.error_call'):
         return None
     else:
         environ['pylons.error_call'] = True
+
+    from pylons import c
+
+    # c is not always registered with the paste registry by the time we get to
+    # this error_mapper. if it's not, we can safely assume that we didn't use
+    # the pagecache. one such case where this happens is the
+    # DomainMiddleware-based srname.reddit.com -> reddit.com/r/srname redirect.
+    try:
+        if c.used_cache:
+            return
+    except TypeError:
+        pass
 
     if global_conf is None:
         global_conf = {}
@@ -212,18 +223,17 @@ class SubredditMiddleware(object):
         return self.app(environ, start_response)
 
 class DomainListingMiddleware(object):
-    domain_pattern = re.compile(r'\A/domain/(([-\w]+\.)+[\w]+)')
-
     def __init__(self, app):
         self.app = app
 
     def __call__(self, environ, start_response):
         if not environ.has_key('subreddit'):
             path = environ['PATH_INFO']
-            domain = self.domain_pattern.match(path)
-            if domain:
-                environ['domain'] = domain.groups()[0]
-                environ['PATH_INFO'] = self.domain_pattern.sub('', path) or '/'
+            domain, rest = path_info_split(path)
+            if domain == "domain" and rest:
+                domain, rest = path_info_split(rest)
+                environ['domain'] = domain
+                environ['PATH_INFO'] = rest or '/'
         return self.app(environ, start_response)
 
 class ExtensionMiddleware(object):
@@ -253,31 +263,18 @@ class ExtensionMiddleware(object):
 
         return self.app(environ, start_response)
 
-class RewriteMiddleware(object):
+class FullPathMiddleware(object):
+    # Debt: we have a lot of middleware which (unfortunately) modify the
+    # global URL PATH_INFO string. To work with the original request URL, we
+    # save it to a different location here.
     def __init__(self, app):
         self.app = app
 
-    def rewrite(self, regex, out_template, input):
-        m = regex.match(input)
-        out = out_template
-        if m:
-            for num, group in enumerate(m.groups('')):
-                out = out.replace('$%s' % (num + 1), group)
-            return out
-
     def __call__(self, environ, start_response):
-        path = environ['PATH_INFO']
-        for r in rewrites:
-            newpath = self.rewrite(r[0], r[1], path)
-            if newpath:
-                environ['PATH_INFO'] = newpath
-                break
-
         environ['FULLPATH'] = environ.get('PATH_INFO')
         qs = environ.get('QUERY_STRING')
         if qs:
             environ['FULLPATH'] += '?' + qs
-
         return self.app(environ, start_response)
 
 class StaticTestMiddleware(object):
@@ -356,6 +353,26 @@ class CleanupMiddleware(object):
                     seen.add(key)
             return start_response(status, fixed, exc_info)
         return self.app(environ, custom_start_response)
+
+
+class SafetyMiddleware(object):
+    """Clean up any attempts at response splitting in headers."""
+
+    has_bad_characters = re.compile("[\r\n]")
+    sanitizer = re.compile("[\r\n]+[ \t]*")
+
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        def safe_start_response(status, headers, exc_info=None):
+            sanitized = []
+            for name, value in headers:
+                if self.has_bad_characters.search(value):
+                    value = self.sanitizer.sub("", value)
+                sanitized.append((name, value))
+            return start_response(status, sanitized, exc_info)
+        return self.app(environ, safe_start_response)
 
 
 class RedditApp(PylonsApp):
@@ -453,11 +470,12 @@ def make_app(global_conf, full_stack=True, **app_conf):
         static_cascade.insert(0, plugin_static_apps)
     app = Cascade(static_cascade)
 
-    #add the rewrite rules
-    app = RewriteMiddleware(app)
+    app = FullPathMiddleware(app)
 
     if not g.config['uncompressedJS'] and g.config['debug']:
         static_fallback = StaticTestMiddleware(static_app, g.config['static_path'], g.config['static_domain'])
         app = Cascade([static_fallback, app])
+
+    app = SafetyMiddleware(app)
 
     return app

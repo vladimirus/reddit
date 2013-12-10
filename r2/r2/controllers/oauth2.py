@@ -37,7 +37,7 @@ from r2.models.token import (
 from r2.lib.errors import ForbiddenError, errors
 from r2.lib.pages import OAuth2AuthorizationPage
 from r2.lib.require import RequirementException, require, require_split
-from r2.lib.utils import parse_http_basic
+from r2.lib.utils import constant_time_compare, parse_http_basic
 from r2.lib.validator import (
     nop,
     validate,
@@ -113,7 +113,6 @@ class OAuth2FrontendController(RedditController):
         self._check_redirect_uri(client, redirect_uri)
 
         if not c.errors:
-            c.deny_frames = True
             return OAuth2AuthorizationPage(client, redirect_uri, scope, state,
                                            duration).render()
         else:
@@ -156,7 +155,7 @@ class OAuth2AccessController(MinimalController):
             client_id, client_secret = parse_http_basic(auth)
             client = OAuth2Client.get_token(client_id)
             require(client)
-            require(client.secret == client_secret)
+            require(constant_time_compare(client.secret, client_secret))
             return client
         except RequirementException:
             abort(401, headers=[("WWW-Authenticate", 'Basic realm="reddit"')])
@@ -218,7 +217,7 @@ class OAuth2AccessController(MinimalController):
             if access_token:
                 resp["access_token"] = access_token._id
                 resp["token_type"] = access_token.token_type
-                resp["expires_in"] = access_token._ttl
+                resp["expires_in"] = int(access_token._ttl) if access_token._ttl else None
                 resp["scope"] = access_token.scope
                 if refresh_token:
                     resp["refresh_token"] = refresh_token._id

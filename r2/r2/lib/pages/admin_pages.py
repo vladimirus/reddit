@@ -48,6 +48,12 @@ class AdminSidebar(Templated):
         self.user = user
 
 
+class SponsorSidebar(Templated):
+    def __init__(self, user):
+        Templated.__init__(self)
+        self.user = user
+
+
 class Details(Templated):
     def __init__(self, link, *a, **kw):
         Templated.__init__(self, *a, **kw)
@@ -67,6 +73,12 @@ class AdminProfileMenu(NavMenu):
     def __init__(self, path):
         NavMenu.__init__(self, [], base_path = path,
                          title = 'admin', type="tabdrop")
+
+
+class AdminLinkMenu(NavMenu):
+    def __init__(self, link):
+        NavMenu.__init__(self, [], title='admin', type="tabdrop")
+
 
 try:
     from r2admin.lib.pages import *

@@ -25,6 +25,12 @@ r.wiki = {
 
     init: function() {
         $('body').delegate('.wiki-page .revision_hide', 'click', this.toggleHide)
+        $('body').delegate('.wiki-page .toggle-source', 'click', this.toggleSource)
+    },
+
+    toggleSource: function(event) {
+        event.preventDefault()
+        $('.wiki-page .source').toggle('slow')
     },
 
     toggleHide: function(event) {
@@ -83,11 +89,17 @@ r.wiki = {
         conflict.hide()
         special.hide()
         params = r.utils.serializeForm($this)
+        $('#wiki_save_button').attr("disabled", true)
+        $this.addClass("working")
         r.wiki.request({
             url: url,
             type: 'POST',
             dataType: 'json',
             data: params,
+            error: function() {
+                $this.removeClass("working")
+                $('#wiki_save_button').removeAttr("disabled")
+            },
             success: function() {
                 window.location = r.wiki.baseUrl() + '/' + r.config.wiki_page
             },
@@ -95,8 +107,9 @@ r.wiki = {
                 409: function(xhr) {
                     var info = JSON.parse(xhr.responseText)
                         ,content = $this.children('#wiki_page_content')
+                        ,diff = conflict.children('#yourdiff')
                     conflict.children('#youredit').val(content.val())
-                    conflict.children('#yourdiff').html(info.diffcontent)
+                    diff.html($.unsafe(info.diffcontent))
                     $this.children('#previous').val(info.newrevision)
                     content.val(info.newcontent)
                     conflict.fadeIn('slow')
@@ -106,7 +119,7 @@ r.wiki = {
                         ,specials = special.children('#specials')
                     specials.empty()
                     for(i in errors) {
-                        specials.append(errors[i]+'<br/>')
+                        specials.append($('<p>').text(errors[i]))
                     }
                     special.fadeIn('slow')
                 },
@@ -129,5 +142,14 @@ r.wiki = {
             url += '&v2=' + v2
         }
         window.location = url
+    },
+
+    helpon: function(elem) {
+        $(elem).parents("form").children(".markhelp:first").show();
+    },
+
+    helpoff: function(elem) {
+        $(elem).parents("form").children(".markhelp:first").hide();
     }
+
 }

@@ -20,25 +20,79 @@
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from collections import namedtuple
 from datetime import datetime, timedelta
 from uuid import uuid1
-import json
 
+from pycassa.types import CompositeType
 from pylons import g, c
+from pylons.i18n import _, N_
 
 from r2.lib import filters
 from r2.lib.cache import sgm
 from r2.lib.db import tdb_cassandra
 from r2.lib.db.thing import Thing, NotFound
 from r2.lib.memoize import memoize
-from r2.lib.utils import Enum
+from r2.lib.utils import Enum, to_datetime, to_date
 from r2.models.subreddit import Subreddit
 
 
 PROMOTE_STATUS = Enum("unpaid", "unseen", "accepted", "rejected",
                       "pending", "promoted", "finished")
 
+class PriorityLevel(object):
+    name = ''
+    _text = N_('')
+    _description = N_('')
+    value = 1   # Values are from 1 (highest) to 100 (lowest)
+    default = False
+    inventory_override = False
+    cpm = True  # Non-cpm is percentage, will fill unsold impressions
+
+    def __repr__(self):
+        return "<PriorityLevel %s: %s>" % (self.name, self.value)
+
+    @property
+    def text(self):
+        return _(self._text) if self._text else ''
+
+    @property
+    def description(self):
+        return _(self._description) if self._description else ''
+
+
+class HighPriority(PriorityLevel):
+    name = 'high'
+    _text = N_('highest')
+    value = 5
+
+
+class MediumPriority(PriorityLevel):
+    name = 'standard'
+    _text = N_('standard')
+    value = 10
+    default = True
+
+
+class RemnantPriority(PriorityLevel):
+    name = 'remnant'
+    _text = N_('remnant')
+    _description = N_('lower priority, impressions are not guaranteed')
+    value = 20
+    inventory_override = True
+
+
+class HousePriority(PriorityLevel):
+    name = 'house'
+    _text = N_('house')
+    _description = N_('non-CPM, displays in all unsold impressions')
+    value = 30
+    inventory_override = True
+    cpm = False
+
+
+HIGH, MEDIUM, REMNANT, HOUSE = HighPriority(), MediumPriority(), RemnantPriority(), HousePriority()
+PROMOTE_PRIORITIES = {p.name: p for p in (HIGH, MEDIUM, REMNANT, HOUSE)}
+PROMOTE_DEFAULT_PRIORITY = MEDIUM
 
 @memoize("get_promote_srid")
 def get_promote_srid(name = 'promos'):
@@ -54,19 +108,45 @@ def get_promote_srid(name = 'promos'):
     return sr._id
 
 
+def calc_impressions(bid, cpm_pennies):
+    # bid is in dollars, cpm_pennies is pennies
+    # CPM is cost per 1000 impressions
+    return int(bid / cpm_pennies * 1000 * 100)
+
+
 NO_TRANSACTION = 0
 
 class PromoCampaign(Thing):
-    
+    _defaults = dict(
+        priority_name=PROMOTE_DEFAULT_PRIORITY.name,
+        trans_id=NO_TRANSACTION,
+    )
+
+    def __getattr__(self, attr):
+        val = Thing.__getattr__(self, attr)
+        if attr in ('start_date', 'end_date'):
+            val = to_datetime(val)
+            if not val.tzinfo:
+                val = val.replace(tzinfo=g.tz)
+        return val
+
+    @classmethod
+    def get_priority_name(cls, priority):
+        if not priority in PROMOTE_PRIORITIES.values():
+            raise ValueError("%s is not a valid priority" % val)
+        return priority.name
+
     @classmethod 
-    def _new(cls, link, sr_name, bid, start_date, end_date):
+    def _new(cls, link, sr_name, bid, cpm, start_date, end_date, priority):
         pc = PromoCampaign(link_id=link._id,
                            sr_name=sr_name,
                            bid=bid,
+                           cpm=cpm,
                            start_date=start_date,
                            end_date=end_date,
                            trans_id=NO_TRANSACTION,
-                           owner_id=link.author_id)
+                           owner_id=link.author_id,
+                           priority_name=cls.get_priority_name(priority))
         pc._commit()
         return pc
 
@@ -87,6 +167,23 @@ class PromoCampaign(Thing):
         '''
         return cls._query(PromoCampaign.c.owner_id == account_id, data=True)
 
+    @property
+    def ndays(self):
+        return (self.end_date - self.start_date).days
+
+    @property
+    def impressions(self):
+        # deal with pre-CPM PromoCampaigns
+        if not hasattr(self, 'cpm'):
+            return -1
+        elif not self.priority.cpm:
+            return -1
+        return calc_impressions(self.bid, self.cpm)
+
+    @property
+    def priority(self):
+        return PROMOTE_PRIORITIES[self.priority_name]
+
     def is_freebie(self):
         return self.trans_id < 0
 
@@ -94,12 +191,15 @@ class PromoCampaign(Thing):
         now = datetime.now(g.tz)
         return self.start_date < now and self.end_date > now
 
-    def update(self, start_date, end_date, bid, sr_name, trans_id, commit=True):
+    def update(self, start_date, end_date, bid, cpm, sr_name, trans_id,
+               priority, commit=True):
         self.start_date = start_date
         self.end_date = end_date
         self.bid = bid
+        self.cpm = cpm
         self.sr_name = sr_name
         self.trans_id = trans_id
+        self.priority_name = self.get_priority_name(priority)
         if commit:
             self._commit()
 
@@ -137,93 +237,70 @@ class PromotionLog(tdb_cassandra.View):
         return [t[1] for t in tuples]
 
 
-AdWeight = namedtuple('AdWeight', 'link weight campaign')
-
-
-class LiveAdWeights(object):
-    """Data store for per-subreddit lists of currently running ads"""
-    __metaclass__ = tdb_cassandra.ThingMeta
+class PromotedLinkRoadblock(tdb_cassandra.View):
     _use_db = True
     _connection_pool = 'main'
-    _type_prefix = None
-    _cf_name = None
-    _compare_with = tdb_cassandra.ASCII_TYPE
-    # TTL is 12 hours, to avoid unexpected ads running indefinitely
-    # See note in set_all_from_weights() for more information
-    _ttl = timedelta(hours=12)
-
-    column = 'adweights'
-    cache = g.cache
-    cache_prefix = 'live-adweights-'
-
-    ALL_ADS = 'all'
-    FRONT_PAGE = 'frontpage'
-
-    def __init__(self):
-        raise NotImplementedError()
+    _read_consistency_level = tdb_cassandra.CL.ONE
+    _write_consistency_level = tdb_cassandra.CL.QUORUM
+    _compare_with = CompositeType(
+        tdb_cassandra.DateType(),
+        tdb_cassandra.DateType(),
+    )
 
     @classmethod
-    def to_columns(cls, weights):
-        """Generate a serializable dict representation weights"""
-        return {cls.column: json.dumps(weights)}
+    def _column(cls, start, end):
+        start, end = map(to_datetime, [start, end])
+        return {(start, end): ''}
 
     @classmethod
-    def from_columns(cls, columns):
-        """Given a (serializable) dict, restore the weights"""
-        weights = json.loads(columns.get(cls.column, '[]')) if columns else []
-        # JSON doesn't have the concept of tuples; this restores the return
-        # value to being a list of tuples.
-        return [AdWeight(*w) for w in weights]
+    def _dates_from_key(cls, key):
+        start, end = map(to_date, key)
+        return start, end
 
     @classmethod
-    def _load_multi(cls, sr_ids):
-        skeys = {sr_id: str(sr_id) for sr_id in sr_ids}
-        adweights = cls._cf.multiget(skeys.values(), columns=[cls.column])
-        res = {}
-        for sr_id in sr_ids:
-            # The returned dictionary should include all sr_ids, so
-            # that ad-less SRs are inserted into the cache
-            res[skeys[sr_id]] = adweights.get(sr_id, {})
-        return res
+    def add(cls, sr, start, end):
+        rowkey = sr._id36
+        column = cls._column(start, end)
+        now = datetime.now(g.tz).date()
+        ndays = (to_date(end) - now).days + 7
+        ttl = timedelta(days=ndays).total_seconds()
+        cls._set_values(rowkey, column, ttl=ttl)
 
     @classmethod
-    def get(cls, sr_ids):
-        """Return a dictionary of sr_id -> list of ads for each of sr_ids"""
-        # Mangling: Caller convention is to use empty string for FRONT_PAGE
-        sr_ids = [(sr_id or cls.FRONT_PAGE) for sr_id in sr_ids]
-        adweights = sgm(cls.cache, sr_ids, cls._load_multi,
-                        prefix=cls.cache_prefix, stale=True)
-        results = {sr_id: cls.from_columns(adweights[sr_id])
-                   for sr_id in adweights}
-        if cls.FRONT_PAGE in results:
-            results[''] = results.pop(cls.FRONT_PAGE)
-        return results
+    def remove(cls, sr, start, end):
+        rowkey = sr._id36
+        column = cls._column(start, end)
+        cls._remove(rowkey, column)
 
     @classmethod
-    def set_all_from_weights(cls, all_weights):
-        """Given a dictionary with all ads that should currently be running
-        (where the dictionary keys are the subreddit IDs, and the paired
-        value is the list of ads for that subreddit), update the ad system
-        to use those ads on those subreddits.
+    def is_roadblocked(cls, sr, start, end):
+        rowkey = sr._id36
+        start, end = map(to_date, [start, end])
 
-        Note: Old ads are not cleared out. It is expected that the caller
-        include empty-list entries in `all_weights` for any Subreddits
-        that should be cleared.
+        # retrieve columns for roadblocks starting before end
+        try:
+            columns = cls._cf.get(rowkey, column_finish=(to_datetime(end),),
+                                  column_count=tdb_cassandra.max_column_count)
+        except tdb_cassandra.NotFoundException:
+            return False
 
-        """
-        weights = {}
-        all_ads = []
-        for sr_id, sr_ads in all_weights.iteritems():
-            all_ads.extend(sr_ads)
-            weights[str(sr_id)] = cls.to_columns(sr_ads)
-        weights[cls.ALL_ADS] = cls.to_columns(all_ads)
+        for key in columns.iterkeys():
+            rb_start, rb_end = cls._dates_from_key(key)
 
-        cls._cf.batch_insert(weights, ttl=cls._ttl)
-
-        # Prep the cache!
-        cls.cache.set_multi(weights, prefix=cls.cache_prefix)
+            # check for overlap, end dates not inclusive
+            if (start < rb_end) and (rb_start < end):
+                return (rb_start, rb_end)
+        return False
 
     @classmethod
-    def clear(cls, sr_id):
-        """Clear ad information from the Subreddit with ID `sr_id`"""
-        cls.set_all_from_weights({sr_id: []})
+    def get_roadblocks(cls):
+        ret = []
+        q = cls._cf.get_range()
+        rows = list(q)
+        srs = Subreddit._byID36([id36 for id36, columns in rows], data=True)
+        for id36, columns in rows:
+            sr = srs[id36]
+            for key in columns.iterkeys():
+                start, end = cls._dates_from_key(key)
+                ret.append((sr.name, start, end))
+        return ret

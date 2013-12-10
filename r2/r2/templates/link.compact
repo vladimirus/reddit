@@ -22,7 +22,7 @@
 
 <%!
    from r2.lib.template_helpers import add_sr
-   from r2.lib.template_helpers import s3_https_if_secure
+   from r2.lib.template_helpers import media_https_if_secure
    import urllib
    from r2.lib.filters import _force_unicode, _force_utf8
  %>
@@ -39,9 +39,16 @@
   %endif
 </%def>
 
-<div class="thing link id-${thing._fullname}">
-  <span class="rank" style="width:${thing.numcolmargin};">
-    ${thing.num}
+<%
+    div_class = "thing link id-%s" % thing._fullname
+    if thing.stickied:
+        div_class += " stickied"
+%>
+<div class="${div_class}">
+  <span class="rank">
+    %if thing.num > 0:
+      ${thing.num}
+    %endif
   </span>
   <% 
      like_cls = "unvoted"
@@ -73,7 +80,7 @@
   %endif
   %if thing.has_thumbnail and thing.thumbnail:
     <a href="${url}" class="thumbnail">
-      <img src="${s3_https_if_secure(thing.thumbnail)}" alt=""/>
+      <img src="${media_https_if_secure(thing.thumbnail)}" alt=""/>
      </a>
   %endif
     <p class="title">
@@ -85,7 +92,7 @@
     %if thing.is_self:
         (self)
     %else:
-        (<a href="${thing.domain_path}">${thing.domain}</a>)
+        (<a href="${thing.domain_path}.compact">${thing.domain_str}</a>)
     %endif
     </span>
     %if thing.nsfw:

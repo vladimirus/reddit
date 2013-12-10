@@ -25,7 +25,9 @@ import base64
 import traceback
 import ConfigParser
 import codecs
+import itertools
 
+from babel.dates import TIMEDELTA_UNITS
 from urllib import unquote_plus
 from urllib2 import urlopen, Request
 from urlparse import urlparse, urlunparse
@@ -39,7 +41,7 @@ from decimal import Decimal
 from BeautifulSoup import BeautifulSoup, SoupStrainer
 
 from time import sleep
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pylons import c, g
 from pylons.i18n import ungettext, _
 from r2.lib.filters import _force_unicode, _force_utf8
@@ -47,9 +49,9 @@ from mako.filters import url_escape
 from r2.lib.contrib import ipaddress
 from r2.lib.require import require, require_split
 import snudown
- 
+
 from r2.lib.utils._utils import *
-        
+
 iters = (list, tuple, set)
 
 def randstr(len, reallyrandom = False):
@@ -67,7 +69,7 @@ class Storage(dict):
     """
     A Storage object is like a dictionary except `obj.foo` can be used
     in addition to `obj['foo']`.
-    
+
         >>> o = storage(a=1)
         >>> o.a
         1
@@ -81,15 +83,15 @@ class Storage(dict):
         Traceback (most recent call last):
             ...
         AttributeError: 'a'
-    
+
     """
-    def __getattr__(self, key): 
+    def __getattr__(self, key):
         try:
             return self[key]
         except KeyError, k:
             raise AttributeError, k
 
-    def __setattr__(self, key, value): 
+    def __setattr__(self, key, value):
         self[key] = value
 
     def __delattr__(self, key):
@@ -98,73 +100,11 @@ class Storage(dict):
         except KeyError, k:
             raise AttributeError, k
 
-    def __repr__(self):     
+    def __repr__(self):
         return '<Storage ' + dict.__repr__(self) + '>'
 
 storage = Storage
 
-def storify(mapping, *requireds, **defaults):
-    """
-    Creates a `storage` object from dictionary `mapping`, raising `KeyError` if
-    d doesn't have all of the keys in `requireds` and using the default 
-    values for keys found in `defaults`.
-
-    For example, `storify({'a':1, 'c':3}, b=2, c=0)` will return the equivalent of
-    `storage({'a':1, 'b':2, 'c':3})`.
-    
-    If a `storify` value is a list (e.g. multiple values in a form submission), 
-    `storify` returns the last element of the list, unless the key appears in 
-    `defaults` as a list. Thus:
-    
-        >>> storify({'a':[1, 2]}).a
-        2
-        >>> storify({'a':[1, 2]}, a=[]).a
-        [1, 2]
-        >>> storify({'a':1}, a=[]).a
-        [1]
-        >>> storify({}, a=[]).a
-        []
-    
-    Similarly, if the value has a `value` attribute, `storify will return _its_
-    value, unless the key appears in `defaults` as a dictionary.
-    
-        >>> storify({'a':storage(value=1)}).a
-        1
-        >>> storify({'a':storage(value=1)}, a={}).a
-        <Storage {'value': 1}>
-        >>> storify({}, a={}).a
-        {}
-    
-    """
-    def getvalue(x):
-        if hasattr(x, 'value'):
-            return x.value
-        else:
-            return x
-    
-    stor = Storage()
-    for key in requireds + tuple(mapping.keys()):
-        value = mapping[key]
-        if isinstance(value, list):
-            if isinstance(defaults.get(key), list):
-                value = [getvalue(x) for x in value]
-            else:
-                value = value[-1]
-        if not isinstance(defaults.get(key), dict):
-            value = getvalue(value)
-        if isinstance(defaults.get(key), list) and not isinstance(value, list):
-            value = [value]
-        setattr(stor, key, value)
-
-    for (key, value) in defaults.iteritems():
-        result = value
-        if hasattr(stor, key): 
-            result = stor[key]
-        if value == () and not isinstance(result, tuple): 
-            result = (result,)
-        setattr(stor, key, result)
-    
-    return stor
 
 class Enum(Storage):
     def __init__(self, *a):
@@ -175,7 +115,7 @@ class Enum(Storage):
             return item in self.values()
         else:
             return Storage.__contains__(self, item)
-            
+
 
 class Results():
     def __init__(self, sa_ResultProxy, build_fn, do_batch=False):
@@ -287,9 +227,9 @@ def get_title(url):
 def extract_title(data):
     """Tries to extract the value of the title element from a string of HTML"""
     bs = BeautifulSoup(data, convertEntities=BeautifulSoup.HTML_ENTITIES)
-    if not bs:
+    if not bs or not bs.html.head:
         return
-    
+
     title_bs = bs.html.head.title
 
     if not title_bs or not title_bs.string:
@@ -314,7 +254,7 @@ def extract_title(data):
     title = re.sub(r'\s+', ' ', title, flags=re.UNICODE)
 
     return title.encode('utf-8').strip()
-    
+
 valid_schemes = ('http', 'https', 'ftp', 'mailto')
 valid_dns = re.compile('\A[-a-zA-Z0-9]+\Z')
 def sanitize_url(url, require_scheme = False):
@@ -349,21 +289,21 @@ def sanitize_url(url, require_scheme = False):
             return
         if u.username is not None or u.password is not None:
             return
-        labels = u.hostname.split('.')
-        for label in labels:
-            try:
-                #if this succeeds, this portion of the dns is almost
-                #valid and converted to ascii
-                label = label.encode('idna')
-            except TypeError:
-                print "label sucks: [%r]" % label
-                raise
-            except UnicodeError:
+
+        try:
+            idna_hostname = u.hostname.encode('idna')
+        except TypeError as e:
+            g.log.warning("Bad hostname given [%r]: %s", u.hostname, e)
+            raise
+        except UnicodeError:
+            return
+
+        for label in idna_hostname.split('.'):
+            if not re.match(valid_dns, label):
                 return
-            else:
-                #then if this success, this portion of the dns is really valid
-                if not re.match(valid_dns, label):
-                    return
+
+        if idna_hostname != u.hostname:
+            url = urlunparse((u[0], idna_hostname, u[2], u[3], u[4], u[5]))
         return url
 
 def trunc_string(text, length):
@@ -509,7 +449,7 @@ class UrlParser(object):
             q.update(self._url_updates)
             q = query_string(q).lstrip('?')
 
-        # make sure the port is not doubly specified 
+        # make sure the port is not doubly specified
         if self.port and ":" in self.hostname:
             self.hostname = self.hostname.split(':')[0]
 
@@ -542,7 +482,9 @@ class UrlParser(object):
         from pylons import g
         from r2.models import Subreddit, Sub, NotFound, DefaultSR
         try:
-            if not self.hostname or self.hostname.startswith(g.domain):
+            if (not self.hostname or
+                    is_subdomain(self.hostname, g.domain) or
+                    self.hostname.startswith(g.domain)):
                 if self.path.startswith('/r/'):
                     return Subreddit._by_name(self.path.split('/')[2])
                 elif self.path.startswith(('/subreddits/', '/reddits/')):
@@ -574,8 +516,9 @@ class UrlParser(object):
         Adds the subreddit's path to the path if another subreddit's
         prefix is not already present.
         """
-        if not self.path_has_subreddit():
-            self.path = (subreddit.path + self.path)
+        if not (self.path_has_subreddit()
+                or self.path.startswith(subreddit.user_path)):
+            self.path = (subreddit.user_path + self.path)
         return self
 
     @property
@@ -600,7 +543,7 @@ class UrlParser(object):
         if require_frame and not self.query_dict.has_key(self.cname_get):
             return self
 
-        # fetch the subreddit and make sure it 
+        # fetch the subreddit and make sure it
         subreddit = subreddit or self.get_subreddit()
         if subreddit and subreddit.domain:
 
@@ -756,7 +699,7 @@ def fetch_things(t_class,since,until,batch_fn=None,
 
     q = t_class._query(*query_params,
                         **query_dict)
-    
+
     orig_rules = deepcopy(q._rules)
 
     things = list(q)
@@ -914,12 +857,9 @@ def valid_hash(user, hash):
 
 def check_cheating(loc):
     pass
-        
-def vote_hash(user, thing, note='valid'):
-    return user.name
 
-def valid_vote_hash(hash, user, thing):
-    return True
+def vote_hash():
+    return ''
 
 def safe_eval_str(unsafe_str):
     return unsafe_str.replace('\\x3d', '=').replace('\\x26', '&')
@@ -974,12 +914,6 @@ def common_subdomain(domain1, domain2):
                 return d
     return ""
 
-def interleave_lists(*args):
-    max_len = max(len(x) for x in args)
-    for i in xrange(max_len):
-        for a in args:
-            if i < len(a):
-                yield a[i]
 
 def link_from_url(path, filter_spam = False, multiple = True):
     from pylons import c
@@ -1028,9 +962,14 @@ def filter_links(links, filter_spam = False, multiple = True):
     # among those, show them the hottest one
     return links if multiple else links[0]
 
-def url_links_builder(url, exclude=None):
+def url_links_builder(url, exclude=None, num=None, after=None, reverse=None,
+                      count=None):
+    from r2.lib.template_helpers import add_sr
     from r2.models import IDBuilder, Link, NotFound
     from operator import attrgetter
+
+    if url.startswith('/'):
+        url = add_sr(url, force_hostname=True)
 
     try:
         links = tup(Link._by_url(url, None))
@@ -1050,8 +989,9 @@ def url_links_builder(url, exclude=None):
                         c.user_is_admin or
                         link.subreddit.is_moderator(c.user))))
 
-    builder = IDBuilder([link._fullname for link in links],
-                        skip=True, keep_fn=include_link)
+    builder = IDBuilder([link._fullname for link in links], skip=True,
+                        keep_fn=include_link, num=num, after=after,
+                        reverse=reverse, count=count)
 
     return builder
 
@@ -1109,6 +1049,11 @@ def make_offset_date(start_date, interval, future = True,
 def to_date(d):
     if isinstance(d, datetime):
         return d.date()
+    return d
+
+def to_datetime(d):
+    if isinstance(d, date):
+        return datetime(d.year, d.month, d.day)
     return d
 
 def in_chunks(it, size=25):
@@ -1372,7 +1317,7 @@ def thread_dump(*a):
 def constant_time_compare(actual, expected):
     """
     Returns True if the two strings are equal, False otherwise
-    
+
     The time taken is dependent on the number of characters provided
     instead of the number of characters that match.
     """
@@ -1478,9 +1423,8 @@ def weighted_lottery(weights, _random=random.random):
 
 
 def read_static_file_config(config_file):
-    parser = ConfigParser.RawConfigParser()
-    with open(config_file, "r") as cf:
-        parser.readfp(cf)
+    with open(config_file) as f:
+        parser = parse_ini_file(f)
     config = dict(parser.items("static_files"))
 
     s3 = boto.connect_s3(config["aws_access_key_id"],
@@ -1543,3 +1487,55 @@ def canonicalize_email(email):
     localpart = localpart.partition("+")[0]
 
     return localpart + "@" + domain
+
+
+def precise_format_timedelta(delta, locale, threshold=.85, decimals=2):
+    """Like babel.dates.format_datetime but with adjustable precision"""
+    seconds = delta.total_seconds()
+
+    for unit, secs_per_unit in TIMEDELTA_UNITS:
+        value = abs(seconds) / secs_per_unit
+        if value >= threshold:
+            plural_form = locale.plural_form(value)
+            pattern = None
+            for choice in (unit + ':medium', unit):
+                patterns = locale._data['unit_patterns'].get(choice)
+                if patterns is not None:
+                    pattern = patterns[plural_form]
+                    break
+            if pattern is None:
+                return u''
+            decimals = int(decimals)
+            format_string = "%." + str(decimals) + "f"
+            return pattern.replace('{0}', format_string % value)
+    return u''
+
+
+def parse_ini_file(config_file):
+    """Given an open file, read and parse it like an ini file."""
+
+    parser = ConfigParser.RawConfigParser()
+    parser.optionxform = str  # ensure keys are case-sensitive as expected
+    parser.readfp(config_file)
+    return parser
+
+def fuzz_activity(count):
+    """Add some jitter to an activity metric to maintain privacy."""
+    # decay constant is e**(-x / 60)
+    decay = math.exp(float(-count) / 60)
+    jitter = round(5 * decay)
+    return count + random.randint(0, jitter)
+
+# http://docs.python.org/2/library/itertools.html#recipes
+def roundrobin(*iterables):
+    "roundrobin('ABC', 'D', 'EF') --> A D E B F C"
+    # Recipe credited to George Sakkis
+    pending = len(iterables)
+    nexts = itertools.cycle(iter(it).next for it in iterables)
+    while pending:
+        try:
+            for next in nexts:
+                yield next()
+        except StopIteration:
+            pending -= 1
+            nexts = itertools.cycle(itertools.islice(nexts, pending))
